@@ -3,7 +3,7 @@
 
 #include "parser.h"
 
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
@@ -14,12 +14,16 @@
  *
  * One writer (the dissector) calls feed_push(); any thread may poll with
  * feed_since(). Entries hold the parsed summary, not the frame bytes, and
- * are formatted by the reader, so the writer only copies about 100 bytes
- * per frame under an uncontended mutex. Nothing here allocates after
- * feed_init().
+ * are formatted by the reader.
+ *
+ * Lock-free: each slot is a sequence lock over its entry, stored as C11
+ * atomic words, so the writer never waits for a reader (a reader that is
+ * descheduled mid-copy cannot stall capture). A reader skips any slot the
+ * writer is rewriting or has already lapped. Nothing here allocates.
  */
 
 #define FEED_CAP 1024                /* power of two */
+#define FEED_CACHELINE 64
 
 struct feed_entry {
     uint64_t seq;                    /* 1, 2, 3, ... in push order */
@@ -29,13 +33,19 @@ struct feed_entry {
     struct pkt_info info;
 };
 
-struct feed {
-    pthread_mutex_t lock;
-    uint64_t last_seq;               /* seq of the newest entry, 0 if none */
-    struct feed_entry entries[FEED_CAP];
+#define FEED_WORDS ((sizeof(struct feed_entry) + 7) / 8)
+
+struct feed_slot {
+    atomic_uint_fast64_t ver;        /* 2*seq - 1 while writing, 2*seq done */
+    atomic_uint_fast64_t words[FEED_WORDS];
 };
 
-/* Returns 0, or an errno value from pthread_mutex_init(). */
+struct feed {
+    _Alignas(FEED_CACHELINE) atomic_uint_fast64_t last_seq;   /* 0 = empty */
+    _Alignas(FEED_CACHELINE) struct feed_slot slots[FEED_CAP];
+};
+
+/* Always returns 0 (kept int for symmetry with the other modules). */
 int  feed_init(struct feed *f);
 void feed_destroy(struct feed *f);
 
@@ -45,8 +55,9 @@ void feed_push(struct feed *f, const struct timespec *ts, uint8_t pkttype,
 
 /*
  * Copy entries with seq > after_seq into out, oldest first. When more than
- * max qualify, only the newest max are copied. Returns the number copied;
- * *last_seq (if not NULL) receives the newest seq in the feed.
+ * max qualify, only the newest max are copied, and entries overwritten
+ * during the copy are skipped. Returns the number copied; *last_seq (if not
+ * NULL) receives the newest seq in the feed.
  */
 size_t feed_since(struct feed *f, uint64_t after_seq, struct feed_entry *out,
                   size_t max, uint64_t *last_seq);

@@ -6,7 +6,7 @@ CFLAGS   += $(CSTD) $(WARN) -pthread
 CPPFLAGS += -D_DEFAULT_SOURCE -Iinclude
 LDFLAGS  += -pthread
 # Only the application links curses; the unit tests do not.
-CURSES_LIBS ?= $(shell pkg-config --libs ncurses 2>/dev/null || echo -lncurses)
+CURSES_LIBS ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncursesw)
 
 BUILD    := build
 BIN      := $(BUILD)/net-analyzer

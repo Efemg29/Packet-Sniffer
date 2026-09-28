@@ -5,32 +5,71 @@
 #include <stdio.h>
 #include <string.h>
 
+#define RELAXED memory_order_relaxed
+
 int feed_init(struct feed *f)
 {
-    memset(f->entries, 0, sizeof(f->entries));
-    f->last_seq = 0;
-    return pthread_mutex_init(&f->lock, NULL);
+    size_t i, w;
+
+    atomic_init(&f->last_seq, 0);
+    for (i = 0; i < FEED_CAP; i++) {
+        atomic_init(&f->slots[i].ver, 0);
+        for (w = 0; w < FEED_WORDS; w++)
+            atomic_init(&f->slots[i].words[w], 0);
+    }
+    return 0;
 }
 
 void feed_destroy(struct feed *f)
 {
-    pthread_mutex_destroy(&f->lock);
+    (void)f;
 }
 
 void feed_push(struct feed *f, const struct timespec *ts, uint8_t pkttype,
                uint32_t wire_len, const struct pkt_info *info)
 {
-    struct feed_entry *e;
+    uint64_t words[FEED_WORDS];
+    struct feed_entry e;
+    uint64_t seq = atomic_load_explicit(&f->last_seq, RELAXED) + 1;
+    struct feed_slot *s = &f->slots[seq & (FEED_CAP - 1)];
+    size_t w;
 
-    pthread_mutex_lock(&f->lock);
-    e = &f->entries[(f->last_seq + 1) & (FEED_CAP - 1)];
-    e->seq = f->last_seq + 1;
-    e->ts = *ts;
-    e->wire_len = wire_len;
-    e->pkttype = pkttype;
-    e->info = *info;
-    f->last_seq = e->seq;
-    pthread_mutex_unlock(&f->lock);
+    memset(&e, 0, sizeof(e));
+    e.seq = seq;
+    e.ts = *ts;
+    e.wire_len = wire_len;
+    e.pkttype = pkttype;
+    e.info = *info;
+    memset(words, 0, sizeof(words));
+    memcpy(words, &e, sizeof(e));
+
+    /* Release stores on the words (rather than a fence) order the odd
+     * version before them; this is free on x86 and TSan models it. */
+    atomic_store_explicit(&s->ver, 2 * seq - 1, RELAXED);
+    for (w = 0; w < FEED_WORDS; w++)
+        atomic_store_explicit(&s->words[w], words[w], memory_order_release);
+    atomic_store_explicit(&s->ver, 2 * seq, memory_order_release);
+    atomic_store_explicit(&f->last_seq, seq, memory_order_release);
+}
+
+/* Returns 1 and fills *out if slot still holds seq, intact. */
+static int read_slot(const struct feed_slot *s, uint64_t seq,
+                     struct feed_entry *out)
+{
+    uint64_t words[FEED_WORDS];
+    uint64_t v1, v2;
+    size_t w;
+
+    v1 = atomic_load_explicit(&s->ver, memory_order_acquire);
+    if (v1 != 2 * seq)
+        return 0;
+    for (w = 0; w < FEED_WORDS; w++)
+        words[w] = atomic_load_explicit(&s->words[w], memory_order_acquire);
+    v2 = atomic_load_explicit(&s->ver, RELAXED);
+    if (v1 != v2)
+        return 0;
+    memcpy(out, words, sizeof(*out));
+    return 1;
 }
 
 size_t feed_since(struct feed *f, uint64_t after_seq, struct feed_entry *out,
@@ -39,16 +78,14 @@ size_t feed_since(struct feed *f, uint64_t after_seq, struct feed_entry *out,
     uint64_t first, last, seq;
     size_t n = 0;
 
-    pthread_mutex_lock(&f->lock);
-    last = f->last_seq;
+    last = atomic_load_explicit(&f->last_seq, memory_order_acquire);
     first = last >= FEED_CAP ? last - FEED_CAP + 1 : 1;
     if (after_seq + 1 > first)
         first = after_seq + 1;
     if (last >= first && max != 0 && last - first + 1 > max)
         first = last - max + 1;
     for (seq = first; seq <= last && n < max; seq++)
-        out[n++] = f->entries[seq & (FEED_CAP - 1)];
-    pthread_mutex_unlock(&f->lock);
+        n += (size_t)read_slot(&f->slots[seq & (FEED_CAP - 1)], seq, &out[n]);
 
     if (last_seq != NULL)
         *last_seq = last;

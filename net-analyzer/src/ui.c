@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <curses.h>
+#include <locale.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -219,7 +220,7 @@ static void draw_title(struct ui *u, uint64_t now)
 static void draw_bar(int y, int x, int width, const char *label, double pct,
                      attr_t color)
 {
-    int bar_w = width - 16;
+    int bar_w = width - 17;
     int fill, i;
 
     if (bar_w < 4)
@@ -242,7 +243,7 @@ static void draw_bar(int y, int x, int width, const char *label, double pct,
     }
     if (x + 7 + bar_w < COLS)
         mvaddch(y, x + 7 + bar_w, ']');
-    put(y, x + 8 + bar_w, A_NORMAL, "%5.1f%%", pct);
+    put(y, x + 9 + bar_w, A_NORMAL, "%5.1f%%", pct);
 }
 
 /* put() at *x, then advance *x past the text. */
@@ -362,15 +363,19 @@ static void draw_feed(struct ui *u, int top, int rows)
     first = feed_oldest(st);
     if (bottom - first + 1 > (uint64_t)rows)
         first = bottom - (uint64_t)rows + 1;
-    for (seq = first, y = top; seq <= bottom && y < top + rows; seq++, y++) {
+    for (seq = first, y = top; seq <= bottom && y < top + rows; seq++) {
         const struct feed_entry *e = &st->hist[seq & (FEED_CAP - 1)];
 
+        /* feed_since() skips entries the writer lapped mid-copy. */
+        if (e->seq != seq)
+            continue;
         feed_format(e, line, sizeof(line));
         put(y, 1, A_NORMAL, "%s", line);
         /* Colour just the protocol column. */
         put(y, 1 + FEED_COL_TIME + 1 + FEED_COL_DIR + 1,
             proto_attr(st, &e->info) | A_BOLD, "%-*s", FEED_COL_PROTO,
             pkt_l4_str(&e->info));
+        y++;
     }
 }
 
@@ -524,6 +529,9 @@ int ui_open(struct ui *u, const struct ui_config *cfg)
         return -1;
     }
 
+    /* In a UTF-8 locale ncursesw draws ACS lines as Unicode, which every
+     * terminal and multiplexer renders. */
+    setlocale(LC_CTYPE, "");
     /* curses' own SIGTSTP handler would run on an arbitrary thread. */
     signal(SIGTSTP, SIG_IGN);
     scr = newterm(NULL, stdout, stdin);
