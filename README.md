@@ -2,9 +2,13 @@
 
 A raw-socket packet sniffer and protocol analyzer for Linux, written in C11.
 It captures Ethernet frames with `AF_PACKET`, dissects L2/L3/L4 headers with
-strict bounds checking, and prints one line per packet. Capture and
-dissection run on separate threads connected by a lockless ring buffer. It
-keeps live traffic statistics and flags SYN port scans as they happen.
+strict bounds checking, and shows them on an ncurses dashboard (or as plain
+text). Capture and dissection run on separate threads connected by a lockless
+ring buffer. A third thread renders the dashboard. It keeps live traffic
+statistics, flags SYN port scans, and can write a standard `.pcap` file
+without linking libpcap.
+
+![net-analyzer dashboard on loopback, with a port-scan alert](docs/tui-demo.png)
 
 ```
 16:53:19.374512 OUT ICMP 127.0.0.1 -> 127.0.0.1 len=98 ttl=64 type=8 code=0 payload=56
@@ -17,11 +21,14 @@ keeps live traffic statistics and flags SYN port scans as they happen.
 
 ## Status
 
-Phases 1 to 3 of the roadmap are done: the protocol dissector, a two-thread
-capture pipeline built on a lockless ring buffer, and the analytics layer
-(shared traffic metrics and a sliding-window port-scan detector). PCAP export
-and the ncurses dashboard are planned; `pcap_writer.h` and `ui.h` are
-placeholders for now.
+The roadmap is complete:
+
+| Phase | What it adds |
+|-------|----------------|
+| 1 | Bounds-checked L2/L3/L4 dissector and an `AF_PACKET` capture loop |
+| 2 | Lockless single-producer/single-consumer ring and a two-thread pipeline |
+| 3 | Shared traffic metrics and a sliding-window SYN port-scan detector |
+| 4 | libpcap-format writer (`-w`) and the ncurses dashboard on its own thread |
 
 | Layer | Supported |
 |-------|-----------|
@@ -37,11 +44,15 @@ not parsed.
 ## Architecture
 
 ```
-AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer ──> [Thread 2: dissector] ──> stdout
-                                                                          parse_packet + print
+AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer ──> [Thread 2: dissector]
+                                                                          parse_packet
                                                                           ana_record ──> shared metrics
-                                                                          det_observe ─> alerts
-[main thread: sigtimedwait(SIGINT, SIGTERM), 100 ms tick] ── ana_tick (rates), -s stats, stop + join
+                                                                          det_observe ─> alert ring
+                                                                          feed_push ───> packet feed
+                                                                          pcap_write ──> .pcap file (-w)
+[Thread 3: ncurses, 10 Hz] <── ana_snapshot, feed_since, ana_alerts_since
+[main thread: sigtimedwait(SIGINT, SIGTERM, SIGWINCH), 100 ms tick]
+    ana_tick (rates), -s stats, resize flag, stop + join
 ```
 
 - **Ring buffer** (`src/ring_buffer.c`): a single-producer / single-consumer
@@ -67,16 +78,39 @@ AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer
   over the last second. Alerts go into a mutex-protected ring of the last 64,
   which readers poll incrementally with `ana_alerts_since()`.
 - **Detector** (`src/detector.c`): see [Port-scan detection](#port-scan-detection).
-- **Signals**: `SIGINT` and `SIGTERM` are blocked in every thread, and the
-  main thread alone receives them with `sigtimedwait`. On a stop request,
-  Thread 1 exits within one 250 ms `SO_RCVTIMEO` tick. Thread 2 then drains
-  whatever is still queued, both threads are joined, and the program prints a
-  summary and exits with code 0.
+- **Packet feed** (`src/feed.c`): a fixed ring of the last 1024 dissected
+  frames for the dashboard. Each slot is a sequence lock over C11 atomics, so
+  the dissector never waits on the UI thread. The UI skips a slot if the
+  writer laps it mid-copy.
+- **PCAP writer** (`src/pcap_writer.c`): classic libpcap format, no libpcap.
+  The global header is magic `0xa1b2c3d4`, version 2.4, snaplen 65535,
+  link type 1 (Ethernet). Each record stores `ts_sec`, `ts_usec` (from the
+  capture timestamp), `incl_len` and `orig_len`. Frames longer than the
+  snaplen are truncated in the file; `orig_len` keeps the on-wire length.
+  The dissector writes records. It flushes when it goes idle, and the file
+  is flushed and closed on shutdown.
+- **Dashboard** (`src/ui.c`): ncurses (wide build) at 10 Hz. The top shows
+  throughput, packet and byte totals, and TCP/UDP/ICMP/Other percentages.
+  The middle is a scrollable feed of recent frames (time, direction,
+  protocol, `src:port -> dst:port`, length, flags). The bottom highlights
+  anomaly alerts. Input is non-blocking: `q` quits, arrows / `j` / `k` /
+  Page Up / Page Down / `g` / `G` scroll, `p` pauses the feed. `SIGWINCH`
+  is handled on the main thread and the UI resizes; `SIGINT` and `SIGTERM`
+  restore the terminal before the summary is printed.
+- **Signals**: `SIGINT`, `SIGTERM` and `SIGWINCH` are blocked in every
+  thread, and the main thread alone receives them with `sigtimedwait`. On a
+  stop request, Thread 1 exits within one 250 ms `SO_RCVTIMEO` tick. Thread 2
+  then drains whatever is still queued, the UI thread exits within one
+  frame, the terminal is restored, and the program prints a summary and
+  exits with code 0.
 
 ## Requirements
 
 - Linux with glibc
 - GCC or Clang with C11 support, `make` (or CMake 3.16 or newer)
+- ncurses (the wide build, `libncursesw`). Debian/Ubuntu:
+  `sudo apt install build-essential libncurses-dev`
+- `tcpdump` or `tshark` if you want to open the `.pcap` files
 - Root or `CAP_NET_RAW` to capture
 
 ## Build
@@ -98,22 +132,34 @@ Everything is compiled with `-std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -pthr
 ## Run
 
 ```sh
-sudo ./build/net-analyzer -i lo              # loopback only
+sudo ./build/net-analyzer -i lo              # dashboard on loopback
 sudo ./build/net-analyzer -i eth0 -p         # eth0 in promiscuous mode
+sudo ./build/net-analyzer -i eth0 -w eth0.pcap
 sudo ./build/net-analyzer -c 100             # all interfaces, stop after 100 packets
-sudo ./build/net-analyzer -i lo -q -b 1024   # no per-packet output, 1024-slot ring
-sudo ./build/net-analyzer -i eth0 -q -s      # alerts only, plus a stats line every second
+sudo ./build/net-analyzer -i lo -n -q -b 1024
+sudo ./build/net-analyzer -i eth0 -n -q -s   # console, alerts only, stats every second
 ```
+
+When stdin and stdout are a terminal, and none of `-n`, `-q` or `-s` is
+given, the program draws the dashboard. Otherwise it prints lines (console
+mode), which is what you want from a script or a pipe.
 
 | Option     | Meaning |
 |------------|---------|
 | `-i IFACE` | Capture only on `IFACE`. By default all interfaces are captured |
 | `-c COUNT` | Stop after `COUNT` packets |
 | `-b SLOTS` | Ring buffer slots, rounded up to a power of two, 2 to 16384 (default 256, which is 16 MiB) |
+| `-w FILE`  | Also write every captured frame to `FILE` in classic libpcap format |
 | `-p`       | Enable promiscuous mode on `IFACE` (requires `-i`) |
-| `-q`       | Quiet: dissect and count packets but do not print them. Alerts are still printed |
-| `-s`       | Print a traffic stats line (rates, totals, protocol mix, alerts) to stderr every second |
+| `-n`       | Console mode: one line per packet instead of the dashboard |
+| `-q`       | Console mode, quiet: dissect and count packets but do not print them. Alerts are still printed |
+| `-s`       | Console mode, plus a traffic stats line (rates, totals, protocol mix, alerts) on stderr every second |
 | `-h`       | Show help |
+
+In the dashboard: `q` quits, Up/Down or `j`/`k` scroll one row, Page Up/Page
+Down page, `g` jumps to the oldest buffered frame, `G` follows the live
+tail, and `p` pauses the feed. Ctrl-C and `SIGTERM` also quit and restore
+the terminal.
 
 To run without sudo, grant the capability once:
 
@@ -194,9 +240,9 @@ sudo nmap -sS -Pn -p 1-1000 127.0.0.1
 
 ```sh
 cd net-analyzer
-make test               # parser, ring buffer, detector and analyzer unit tests
+make test               # parser, ring, detector, analyzer, pcap writer, feed
 make sanitize           # the same tests under AddressSanitizer + UBSan
-make tsan               # the threaded tests (ring buffer, analyzer) under ThreadSanitizer
+make tsan               # the threaded tests (ring, analyzer, feed) under ThreadSanitizer
 ```
 
 With CMake, run `ctest --test-dir build`.
@@ -233,6 +279,19 @@ writer, two snapshot readers, a ticker, an alert pusher, and an alert poller.
 It checks that every snapshot is internally consistent and that alerts
 arrive in order with none repeated. Set `ANA_STRESS_ITERS` to change the
 packet count.
+
+The PCAP tests check the global header (magic `0xa1b2c3d4`, version 2.4,
+snaplen 65535, link type 1) and record headers byte for byte, including
+microsecond rounding, snaplen clamping, and a `orig_len` that stays at least
+`incl_len`. They round-trip a file, write 20,000 records across the stdio
+buffer, and check that a write error becomes sticky and is reported by
+`pcap_close`. A live capture on `lo` was also opened with `tcpdump -r`,
+`tshark -r` and `capinfos` (Ethernet, microsecond timestamps, snaplen 65535).
+
+The feed tests check incremental polling, overflow keeping the newest 1024
+entries, and the column layout of `feed_format`. A two-thread stress test
+checks that every entry a reader observes matches what the writer pushed.
+Set `FEED_STRESS_ITERS` to change the count; `make tsan` uses 200,000.
 
 On some Clang installs the sanitizer runtimes are missing. If `make sanitize`
 or `make tsan` fails to link, use `make CC=gcc sanitize` or `make CC=gcc tsan`.
@@ -295,11 +354,13 @@ syscall and copy.
 ```
 net-analyzer/
 ├── Makefile, CMakeLists.txt
-├── include/   parser.h, ring_buffer.h, detector.h, analyzer.h, config.h (+ placeholders for Phase 4)
-├── src/       main.c (threads, signals), parser.c (dissector), ring_buffer.c (SPSC ring),
-│              detector.c (port-scan detector), analyzer.c (shared metrics + alerts)
+├── include/   parser.h, ring_buffer.h, detector.h, analyzer.h, feed.h,
+│              pcap_writer.h, ui.h, config.h
+├── src/       main.c (threads, signals), parser.c, ring_buffer.c,
+│              detector.c, analyzer.c, feed.c, pcap_writer.c, ui.c
 ├── scripts/   bench_loopback.sh (iperf3 drop-rate benchmark)
-└── tests/     test_parser.c, test_ring_buffer.c, test_detector.c, test_analyzer.c
+└── tests/     test_parser.c, test_ring_buffer.c, test_detector.c,
+               test_analyzer.c, test_pcap_writer.c, test_feed.c
 ```
 
 ## License

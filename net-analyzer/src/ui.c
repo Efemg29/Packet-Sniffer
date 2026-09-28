@@ -454,12 +454,17 @@ static void render(struct ui *u, uint64_t now)
     refresh();
 }
 
+/*
+ * SIGWINCH path only. resizeterm() queues a KEY_RESIZE, which handle_key()
+ * treats as a plain redraw; calling resizeterm() from there as well turns
+ * two quick resizes into an endless KEY_RESIZE loop.
+ */
 static void handle_resize(void)
 {
     struct winsize ws;
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 &&
-        ws.ws_col > 0)
+        ws.ws_col > 0 && is_term_resized(ws.ws_row, ws.ws_col))
         resizeterm(ws.ws_row, ws.ws_col);
     clear();
 }
@@ -504,7 +509,7 @@ static int handle_key(struct ui *u, int ch)
         st->paused = !st->paused;
         break;
     case KEY_RESIZE:
-        handle_resize();
+        clear();
         break;
     default:
         return 0;
