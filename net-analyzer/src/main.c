@@ -1,8 +1,11 @@
 #include "analyzer.h"
 #include "config.h"
 #include "detector.h"
+#include "feed.h"
 #include "parser.h"
+#include "pcap_writer.h"
 #include "ring_buffer.h"
+#include "ui.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,16 +28,21 @@
 
 #define DEFAULT_RING_SLOTS 256
 
-/* Set by the signal thread, by the worker on -c, or on a fatal error. */
+/* Set by the signal thread, by the worker on -c, by q in the TUI, or on a
+ * fatal error. */
 static atomic_int g_stop;
+/* Set by the signal thread on SIGWINCH; consumed by the UI thread. */
+static atomic_int g_resize;
 
 struct options {
     const char *iface;
+    const char *pcap_path;            /* -w; NULL = off */
     unsigned long long max_packets;   /* 0 = unlimited */
     size_t ring_slots;
     int promisc;
     int quiet;
     int stats;
+    int console;                      /* -n, or implied; see parse_args */
 };
 
 struct capture {
@@ -43,8 +51,13 @@ struct capture {
     struct ring_buffer ring;
     atomic_int ingest_done;
     int ingest_rc;
+    int tui;                          /* ncurses dashboard owns the screen */
     struct analyzer ana;              /* shared metrics; see analyzer.h */
+    struct feed feed;                 /* worker -> UI packet feed */
     struct detector det;              /* owned by the worker */
+    struct pcap_writer pcap;          /* owned by the worker once started */
+    int pcap_on;
+    struct ui ui;
 };
 
 /*
@@ -84,14 +97,19 @@ static int has_cap_net_raw(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-p] [-q] [-s] [-h]\n"
+            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-w FILE] [-p] [-n] [-q] [-s] [-h]\n"
             "  -i IFACE  capture only on IFACE (default: all interfaces)\n"
             "  -c COUNT  stop after COUNT packets\n"
             "  -b SLOTS  ring buffer slots, 64 KiB each (default: %d)\n"
+            "  -w FILE   also write every captured frame to FILE (libpcap format)\n"
             "  -p        put IFACE into promiscuous mode (requires -i)\n"
-            "  -q        quiet: dissect but do not print packets (alerts still print)\n"
-            "  -s        print a traffic stats line to stderr every second\n"
-            "  -h        show this help\n",
+            "  -n        console mode: print lines instead of the ncurses dashboard\n"
+            "  -q        console mode, quiet: do not print packets (alerts still print)\n"
+            "  -s        console mode, plus a traffic stats line on stderr every second\n"
+            "  -h        show this help\n"
+            "The dashboard is used when stdin and stdout are terminals and none of\n"
+            "-n, -q, -s is given. In the dashboard: q quits, arrows/PgUp/PgDn/g/G\n"
+            "scroll the packet feed, p pauses it.\n",
             prog, DEFAULT_RING_SLOTS);
 }
 
@@ -102,10 +120,20 @@ static int parse_args(int argc, char **argv, struct options *opt)
 
     memset(opt, 0, sizeof(*opt));
     opt->ring_slots = DEFAULT_RING_SLOTS;
-    while ((c = getopt(argc, argv, "i:c:b:pqsh")) != -1) {
+    while ((c = getopt(argc, argv, "i:c:b:w:pnqsh")) != -1) {
         switch (c) {
         case 'i':
             opt->iface = optarg;
+            break;
+        case 'w':
+            if (optarg[0] == '\0') {
+                fprintf(stderr, "-w needs a file name\n");
+                return -1;
+            }
+            opt->pcap_path = optarg;
+            break;
+        case 'n':
+            opt->console = 1;
             break;
         case 'c':
             errno = 0;
@@ -152,6 +180,9 @@ static int parse_args(int argc, char **argv, struct options *opt)
         fprintf(stderr, "-p requires -i IFACE\n");
         return -1;
     }
+    if (opt->quiet || opt->stats || !isatty(STDIN_FILENO) ||
+        !isatty(STDOUT_FILENO))
+        opt->console = 1;
     return 0;
 }
 
@@ -329,6 +360,11 @@ static void *worker_thread(void *arg)
                 (s = rb_peek(rb)) == NULL)
                 break;
             if (s == NULL) {
+                /* Flush once per idle period, not per frame, so the file
+                 * stays current under light traffic without a syscall per
+                 * packet under load. */
+                if (cap->pcap_on && cap->pcap.unflushed != 0)
+                    pcap_flush(&cap->pcap);
                 idle_backoff(&spins);
                 continue;
             }
@@ -337,14 +373,19 @@ static void *worker_thread(void *arg)
 
         parse_packet(s->data, s->cap_len, &info);
         ana_record(&cap->ana, &info, s->orig_len);
-        if (!opt->quiet)
+        if (cap->pcap_on)
+            pcap_write(&cap->pcap, &s->ts, s->data, s->cap_len, s->orig_len);
+        if (cap->tui)
+            feed_push(&cap->feed, &s->ts, s->pkttype, s->orig_len, &info);
+        else if (!opt->quiet)
             print_packet(s, &info);
         /* Outgoing frames are skipped so loopback traffic, which is seen
          * once as OUT and once as IN, is only counted once. */
         if (s->pkttype != PACKET_OUTGOING &&
             det_observe(&cap->det, &info, ts_ns(&s->ts), &alert)) {
             ana_push_alert(&cap->ana, &alert);
-            print_alert(s, &alert, &cap->det.cfg);
+            if (!cap->tui)
+                print_alert(s, &alert, &cap->det.cfg);
         }
         rb_release(rb);
 
@@ -378,9 +419,9 @@ static void print_stats_line(struct analyzer *ana)
 }
 
 /*
- * Runs on the main thread with SIGINT/SIGTERM blocked process-wide, so it is
- * the only place those signals are ever handled. It is also the analyzer's
- * rate ticker.
+ * Runs on the main thread with SIGINT/SIGTERM/SIGWINCH blocked process-wide,
+ * so it is the only place those signals are ever handled. It is also the
+ * analyzer's rate ticker.
  */
 static void wait_for_stop(struct capture *cap, const sigset_t *set)
 {
@@ -394,6 +435,8 @@ static void wait_for_stop(struct capture *cap, const sigset_t *set)
 
         if (sig == SIGINT || sig == SIGTERM)
             request_stop();
+        else if (sig == SIGWINCH)
+            atomic_store_explicit(&g_resize, 1, memory_order_relaxed);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         now_ns = ts_ns(&now);
@@ -450,13 +493,43 @@ static void print_summary(struct capture *cap)
                 ks.tp_packets, ks.tp_drops);
 }
 
+/* Returns 0, or -1 if the pcap file hit an error at any point. */
+static int finish_pcap(struct capture *cap)
+{
+    int err;
+
+    if (!cap->pcap_on)
+        return 0;
+    err = pcap_close(&cap->pcap);
+    cap->pcap_on = 0;
+    if (err != 0) {
+        fprintf(stderr, "pcap: error writing %s after %llu packets: %s\n",
+                cap->opt->pcap_path, (unsigned long long)cap->pcap.packets,
+                strerror(err));
+        return -1;
+    }
+    fprintf(stderr, "pcap: %llu packets, %llu bytes written to %s\n",
+            (unsigned long long)cap->pcap.packets,
+            (unsigned long long)cap->pcap.bytes, cap->opt->pcap_path);
+    return 0;
+}
+
+static void cleanup(struct capture *cap)
+{
+    finish_pcap(cap);
+    feed_destroy(&cap->feed);
+    ana_destroy(&cap->ana);
+    rb_destroy(&cap->ring);
+    close(cap->fd);
+}
+
 int main(int argc, char **argv)
 {
     struct options opt;
     static struct capture cap;
-    pthread_t ingest, worker;
+    pthread_t ingest, worker, ui_tid;
     sigset_t sigs;
-    int err;
+    int err, rc;
 
     if (parse_args(argc, argv, &opt) != 0) {
         usage(argv[0]);
@@ -476,6 +549,7 @@ int main(int argc, char **argv)
     sigemptyset(&sigs);
     sigaddset(&sigs, SIGINT);
     sigaddset(&sigs, SIGTERM);
+    sigaddset(&sigs, SIGWINCH);
     err = pthread_sigmask(SIG_BLOCK, &sigs, NULL);
     if (err != 0) {
         fprintf(stderr, "pthread_sigmask: %s\n", strerror(err));
@@ -483,6 +557,7 @@ int main(int argc, char **argv)
     }
 
     cap.opt = &opt;
+    cap.tui = !opt.console;
     cap.fd = open_capture_socket(&opt);
     if (cap.fd < 0)
         return EXIT_FAILURE;
@@ -500,11 +575,45 @@ int main(int argc, char **argv)
         close(cap.fd);
         return EXIT_FAILURE;
     }
+    err = feed_init(&cap.feed);
+    if (err != 0) {
+        fprintf(stderr, "feed: %s\n", strerror(err));
+        ana_destroy(&cap.ana);
+        rb_destroy(&cap.ring);
+        close(cap.fd);
+        return EXIT_FAILURE;
+    }
     det_init(&cap.det, NULL);
 
-    fprintf(stderr, "capturing on %s%s, %zu ring slots (Ctrl-C to stop)\n",
-            opt.iface ? opt.iface : "all interfaces",
-            opt.promisc ? " [promiscuous]" : "", cap.ring.capacity);
+    if (opt.pcap_path != NULL) {
+        err = pcap_open(&cap.pcap, opt.pcap_path);
+        if (err != 0) {
+            fprintf(stderr, "pcap: cannot write %s: %s\n", opt.pcap_path,
+                    strerror(err));
+            cleanup(&cap);
+            return EXIT_FAILURE;
+        }
+        cap.pcap_on = 1;
+    }
+
+    if (cap.tui) {
+        struct ui_config uc = {
+            .ana = &cap.ana, .feed = &cap.feed, .ring = &cap.ring,
+            .iface = opt.iface, .pcap_path = opt.pcap_path,
+            .stop = &g_stop, .resize = &g_resize,
+        };
+
+        if (ui_open(&cap.ui, &uc) != 0) {
+            cleanup(&cap);
+            return EXIT_FAILURE;
+        }
+    } else {
+        fprintf(stderr, "capturing on %s%s, %zu ring slots%s%s (Ctrl-C to stop)\n",
+                opt.iface ? opt.iface : "all interfaces",
+                opt.promisc ? " [promiscuous]" : "", cap.ring.capacity,
+                opt.pcap_path ? ", writing " : "",
+                opt.pcap_path ? opt.pcap_path : "");
+    }
 
     err = pthread_create(&worker, NULL, worker_thread, &cap);
     if (err == 0) {
@@ -514,24 +623,35 @@ int main(int argc, char **argv)
             pthread_join(worker, NULL);
         }
     }
+    if (err == 0 && cap.tui) {
+        err = pthread_create(&ui_tid, NULL, ui_run, &cap.ui);
+        if (err != 0) {
+            request_stop();
+            pthread_join(ingest, NULL);
+            pthread_join(worker, NULL);
+        }
+    }
     if (err != 0) {
+        ui_close(&cap.ui);
         fprintf(stderr, "pthread_create: %s\n", strerror(err));
-        ana_destroy(&cap.ana);
-        rb_destroy(&cap.ring);
-        close(cap.fd);
+        cleanup(&cap);
         return EXIT_FAILURE;
     }
 
     wait_for_stop(&cap, &sigs);
 
-    /* Ingestion exits within one SO_RCVTIMEO tick; the worker then drains. */
+    /* Ingestion exits within one SO_RCVTIMEO tick; the worker then drains.
+     * The UI exits within one 100 ms frame and restores the terminal before
+     * the summary is printed. */
+    if (cap.tui)
+        pthread_join(ui_tid, NULL);
+    ui_close(&cap.ui);
     pthread_join(ingest, NULL);
     pthread_join(worker, NULL);
 
     fflush(stdout);
     print_summary(&cap);
-    ana_destroy(&cap.ana);
-    rb_destroy(&cap.ring);
-    close(cap.fd);
-    return cap.ingest_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    rc = finish_pcap(&cap);
+    cleanup(&cap);
+    return cap.ingest_rc == 0 && rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
