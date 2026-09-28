@@ -203,8 +203,9 @@ static void draw_title(struct ui *u, uint64_t now)
     attron(bar);
     mvhline(0, 0, ' ', COLS);
     attroff(bar);
-    put(0, 0, bar, " net-analyzer | %s%s%s", u->cfg.iface ? u->cfg.iface
-                                                          : "all interfaces",
+    put(0, 0, bar, " net-analyzer | %s | %s%s%s",
+        u->cfg.iface ? u->cfg.iface : "all interfaces",
+        u->cfg.ingest ? u->cfg.ingest : "recvfrom",
         u->cfg.pcap_path ? " | pcap: " : "",
         u->cfg.pcap_path ? u->cfg.pcap_path : "");
     x = COLS - (int)strlen(right);

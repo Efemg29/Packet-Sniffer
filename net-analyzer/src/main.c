@@ -5,6 +5,7 @@
 #include "parser.h"
 #include "pcap_writer.h"
 #include "ring_buffer.h"
+#include "rx_ring.h"
 #include "ui.h"
 
 #include <arpa/inet.h>
@@ -43,6 +44,7 @@ struct options {
     int quiet;
     int stats;
     int console;                      /* -n, or implied; see parse_args */
+    int classic;                      /* -R: recvfrom instead of TPACKET_V3 */
 };
 
 struct capture {
@@ -58,6 +60,10 @@ struct capture {
     struct pcap_writer pcap;          /* owned by the worker once started */
     int pcap_on;
     struct ui ui;
+    struct rx_ring *rx;               /* TPACKET_V3 path; NULL = recvfrom */
+    int rcvbuf;                       /* SO_RCVBUF as reported by the kernel */
+    struct rx_cursor cursor;
+    int cursor_live;
 };
 
 /*
@@ -97,15 +103,16 @@ static int has_cap_net_raw(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-w FILE] [-p] [-n] [-q] [-s] [-h]\n"
+            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-w FILE] [-p] [-n] [-q] [-s] [-R] [-h]\n"
             "  -i IFACE  capture only on IFACE (default: all interfaces)\n"
             "  -c COUNT  stop after COUNT packets\n"
-            "  -b SLOTS  ring buffer slots, 64 KiB each (default: %d)\n"
+            "  -b SLOTS  ring depth, 64 KiB each (default: %d)\n"
             "  -w FILE   also write every captured frame to FILE (libpcap format)\n"
             "  -p        put IFACE into promiscuous mode (requires -i)\n"
             "  -n        console mode: print lines instead of the ncurses dashboard\n"
             "  -q        console mode, quiet: do not print packets (alerts still print)\n"
             "  -s        console mode, plus a traffic stats line on stderr every second\n"
+            "  -R        recvfrom path instead of the TPACKET_V3 mapped ring\n"
             "  -h        show this help\n"
             "The dashboard is used when stdin and stdout are terminals and none of\n"
             "-n, -q, -s is given. In the dashboard: q quits, arrows/PgUp/PgDn/g/G\n"
@@ -120,7 +127,7 @@ static int parse_args(int argc, char **argv, struct options *opt)
 
     memset(opt, 0, sizeof(*opt));
     opt->ring_slots = DEFAULT_RING_SLOTS;
-    while ((c = getopt(argc, argv, "i:c:b:w:pnqsh")) != -1) {
+    while ((c = getopt(argc, argv, "i:c:b:w:pnqshR")) != -1) {
         switch (c) {
         case 'i':
             opt->iface = optarg;
@@ -165,6 +172,9 @@ static int parse_args(int argc, char **argv, struct options *opt)
         case 's':
             opt->stats = 1;
             break;
+        case 'R':
+            opt->classic = 1;
+            break;
         case 'h':
             usage(argv[0]);
             exit(EXIT_SUCCESS);
@@ -186,7 +196,23 @@ static int parse_args(int argc, char **argv, struct options *opt)
     return 0;
 }
 
-static int open_capture_socket(const struct options *opt)
+/* Ask for 8 MiB. SO_RCVBUFFORCE bypasses rmem_max when the process has
+ * CAP_NET_ADMIN (root does). The kernel reports twice the stored value. */
+static void enlarge_rcvbuf(int fd, int *got)
+{
+    int want = 8 * 1024 * 1024;
+    int sz = 0;
+    socklen_t len = sizeof(sz);
+
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &want, sizeof(want)) != 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)) != 0) {
+        /* Keep the default buffer. */
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, &len) == 0 && got != NULL)
+        *got = sz;
+}
+
+static int open_capture_socket(int *rcvbuf)
 {
     int fd;
     struct timeval tv = { 0, 250000 };
@@ -197,53 +223,66 @@ static int open_capture_socket(const struct options *opt)
         return -1;
     }
 
-    /* Bounds how long the ingestion thread can block before it re-checks
-     * g_stop. */
+    /* Bounds how long the recvfrom path can block before it re-checks
+     * g_stop. The mapped ring uses poll() with the same 250 ms budget. */
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
         perror("setsockopt(SO_RCVTIMEO)");
         close(fd);
         return -1;
     }
-
-    if (opt->iface != NULL) {
-        struct sockaddr_ll sll;
-        unsigned int ifindex = if_nametoindex(opt->iface);
-
-        if (ifindex == 0) {
-            fprintf(stderr, "unknown interface '%s': %s\n", opt->iface,
-                    strerror(errno));
-            close(fd);
-            return -1;
-        }
-
-        memset(&sll, 0, sizeof(sll));
-        sll.sll_family = AF_PACKET;
-        sll.sll_protocol = htons(ETH_P_ALL);
-        sll.sll_ifindex = (int)ifindex;
-        if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
-            perror("bind");
-            close(fd);
-            return -1;
-        }
-
-        if (opt->promisc) {
-            struct packet_mreq mr;
-
-            memset(&mr, 0, sizeof(mr));
-            mr.mr_ifindex = (int)ifindex;
-            mr.mr_type = PACKET_MR_PROMISC;
-            if (setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr,
-                           sizeof(mr)) != 0) {
-                perror("setsockopt(PACKET_ADD_MEMBERSHIP)");
-                close(fd);
-                return -1;
-            }
-        }
-    }
+    enlarge_rcvbuf(fd, rcvbuf);
     return fd;
 }
 
-static void print_packet(const struct rb_slot *s, const struct pkt_info *info)
+/* PACKET_RX_RING has to be installed before bind. ifindex 0 is every
+ * interface, which the mapped ring needs explicitly. */
+static int bind_capture(int fd, const char *iface, int promisc)
+{
+    struct sockaddr_ll sll;
+    unsigned int ifindex = 0;
+
+    if (iface != NULL) {
+        ifindex = if_nametoindex(iface);
+        if (ifindex == 0) {
+            fprintf(stderr, "unknown interface '%s': %s\n", iface,
+                    strerror(errno));
+            return -1;
+        }
+    }
+
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = (int)ifindex;
+    if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
+        perror("bind");
+        return -1;
+    }
+
+    if (promisc) {
+        struct packet_mreq mr;
+
+        memset(&mr, 0, sizeof(mr));
+        mr.mr_ifindex = (int)ifindex;
+        mr.mr_type = PACKET_MR_PROMISC;
+        if (setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr,
+                       sizeof(mr)) != 0) {
+            perror("setsockopt(PACKET_ADD_MEMBERSHIP)");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+struct frame_view {
+    const uint8_t *data;
+    uint32_t cap_len;
+    uint32_t orig_len;
+    struct timespec ts;
+    uint8_t pkttype;
+};
+
+static void print_packet(const struct frame_view *s, const struct pkt_info *info)
 {
     struct tm tm;
     char line[256];
@@ -260,7 +299,7 @@ static uint64_t ts_ns(const struct timespec *ts)
     return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
 }
 
-static void print_alert(const struct rb_slot *s, const struct det_alert *a,
+static void print_alert(const struct frame_view *s, const struct det_alert *a,
                         const struct det_config *cfg)
 {
     struct tm tm;
@@ -286,10 +325,9 @@ static void fill_slot(struct rb_slot *s, size_t wire_len,
     clock_gettime(CLOCK_REALTIME, &s->ts);
 }
 
-/* Thread 1: socket -> ring. The only producer. */
-static void *ingest_thread(void *arg)
+/* Thread 1 on the recvfrom path: socket -> user ring. The only producer. */
+static void ingest_recvfrom(struct capture *cap)
 {
-    struct capture *cap = arg;
     struct ring_buffer *rb = &cap->ring;
 
     while (!stop_requested()) {
@@ -324,9 +362,75 @@ static void *ingest_thread(void *arg)
         fill_slot(slot, (size_t)n, &from);
         rb_commit(rb);
     }
+}
+
+/* Thread 1: socket -> worker. The only producer. */
+static void *ingest_thread(void *arg)
+{
+    struct capture *cap = arg;
+    int rc;
+
+    if (cap->rx != NULL) {
+        rc = rx_ring_produce(cap->rx, &g_stop);
+        if (rc != 0) {
+            perror("tpacket");
+            cap->ingest_rc = -1;
+            request_stop();
+        }
+    } else {
+        ingest_recvfrom(cap);
+    }
 
     atomic_store_explicit(&cap->ingest_done, 1, memory_order_release);
     return NULL;
+}
+
+/* 1 = a frame is in *v and must be released with release_frame().
+ * 0 = nothing waiting. */
+static int take_frame(struct capture *cap, struct frame_view *v)
+{
+    if (cap->rx == NULL) {
+        const struct rb_slot *s = rb_peek(&cap->ring);
+
+        if (s == NULL)
+            return 0;
+        v->data = s->data;
+        v->cap_len = s->cap_len;
+        v->orig_len = s->orig_len;
+        v->ts = s->ts;
+        v->pkttype = s->pkttype;
+        return 1;
+    }
+
+    for (;;) {
+        struct rx_frame fr;
+
+        if (!cap->cursor_live) {
+            unsigned idx;
+
+            if (!rx_ring_peek(cap->rx, &idx))
+                return 0;
+            rx_cursor_init(&cap->cursor, rx_ring_block(cap->rx, idx),
+                           rx_ring_block_size(cap->rx));
+            cap->cursor_live = 1;
+        }
+        if (rx_cursor_next(&cap->cursor, &fr)) {
+            v->data = fr.data;
+            v->cap_len = fr.cap_len;
+            v->orig_len = fr.orig_len;
+            v->ts = fr.ts;
+            v->pkttype = fr.pkttype;
+            return 1;
+        }
+        rx_ring_retire(cap->rx);
+        cap->cursor_live = 0;
+    }
+}
+
+static void release_frame(struct capture *cap)
+{
+    if (cap->rx == NULL)
+        rb_release(&cap->ring);
 }
 
 static void idle_backoff(unsigned *spins)
@@ -341,25 +445,25 @@ static void idle_backoff(unsigned *spins)
     }
 }
 
-/* Thread 2: ring -> parser -> stdout. The only consumer. */
+/* Thread 2: frames -> parser -> stdout. The only consumer. */
 static void *worker_thread(void *arg)
 {
     struct capture *cap = arg;
-    struct ring_buffer *rb = &cap->ring;
     const struct options *opt = cap->opt;
     struct pkt_info info;
     struct det_alert alert;
     unsigned spins = 0;
 
     for (;;) {
-        const struct rb_slot *s = rb_peek(rb);
+        struct frame_view s;
 
-        if (s == NULL) {
+        memset(&s, 0, sizeof(s));
+        if (!take_frame(cap, &s)) {
             /* Drain everything already queued before exiting. */
             if (atomic_load_explicit(&cap->ingest_done, memory_order_acquire) &&
-                (s = rb_peek(rb)) == NULL)
+                !take_frame(cap, &s))
                 break;
-            if (s == NULL) {
+            if (s.data == NULL) {
                 /* Flush once per idle period, not per frame, so the file
                  * stays current under light traffic without a syscall per
                  * packet under load. */
@@ -371,23 +475,23 @@ static void *worker_thread(void *arg)
         }
         spins = 0;
 
-        parse_packet(s->data, s->cap_len, &info);
-        ana_record(&cap->ana, &info, s->orig_len);
+        parse_packet(s.data, s.cap_len, &info);
+        ana_record(&cap->ana, &info, s.orig_len);
         if (cap->pcap_on)
-            pcap_write(&cap->pcap, &s->ts, s->data, s->cap_len, s->orig_len);
+            pcap_write(&cap->pcap, &s.ts, s.data, s.cap_len, s.orig_len);
         if (cap->tui)
-            feed_push(&cap->feed, &s->ts, s->pkttype, s->orig_len, &info);
+            feed_push(&cap->feed, &s.ts, s.pkttype, s.orig_len, &info);
         else if (!opt->quiet)
-            print_packet(s, &info);
+            print_packet(&s, &info);
         /* Outgoing frames are skipped so loopback traffic, which is seen
          * once as OUT and once as IN, is only counted once. */
-        if (s->pkttype != PACKET_OUTGOING &&
-            det_observe(&cap->det, &info, ts_ns(&s->ts), &alert)) {
+        if (s.pkttype != PACKET_OUTGOING &&
+            det_observe(&cap->det, &info, ts_ns(&s.ts), &alert)) {
             ana_push_alert(&cap->ana, &alert);
             if (!cap->tui)
-                print_alert(s, &alert, &cap->det.cfg);
+                print_alert(&s, &alert, &cap->det.cfg);
         }
-        rb_release(rb);
+        release_frame(cap);
 
         if (opt->max_packets != 0 &&
             ana_packets(&cap->ana) >= opt->max_packets) {
@@ -459,8 +563,6 @@ static void print_summary(struct capture *cap)
     struct ana_snapshot sn;
     struct det_stats ds;
 
-    rb_get_stats(&cap->ring, &rs);
-    offered = (unsigned long long)(rs.pushed + rs.dropped);
     ana_snapshot(&cap->ana, &sn);
     det_get_stats(&cap->det, &ds);
 
@@ -480,17 +582,46 @@ static void print_summary(struct capture *cap)
             "%llu alerts\n",
             (unsigned long long)ds.syns_seen, ds.tracked,
             (unsigned long long)ds.evictions, (unsigned long long)sn.alerts);
-    fprintf(stderr,
-            "ring (%zu slots): %llu queued, %llu dropped (%.3f%%), %zu left unprocessed\n",
-            cap->ring.capacity, (unsigned long long)rs.pushed,
-            (unsigned long long)rs.dropped,
-            offered ? 100.0 * (double)rs.dropped / (double)offered : 0.0,
-            rs.in_use);
+    if (cap->rx != NULL) {
+        struct rx_info ri;
+
+        rx_ring_get_info(cap->rx, &ri);
+        fprintf(stderr,
+                "ingest: tpacket_v3 (%u blocks x %u KiB, %zu MiB), "
+                "%llu frames handed off, %llu left unprocessed\n",
+                ri.blocks, ri.block_size / 1024u, ri.map_len / (1024u * 1024u),
+                (unsigned long long)ri.frames,
+                ri.frames > sn.packets
+                    ? (unsigned long long)(ri.frames - sn.packets) : 0ULL);
+    } else if (cap->ring.slots != NULL) {
+        rb_get_stats(&cap->ring, &rs);
+        offered = (unsigned long long)(rs.pushed + rs.dropped);
+        fprintf(stderr,
+                "ring (%zu slots): %llu queued, %llu dropped (%.3f%%), "
+                "%zu left unprocessed\n",
+                cap->ring.capacity, (unsigned long long)rs.pushed,
+                (unsigned long long)rs.dropped,
+                offered ? 100.0 * (double)rs.dropped / (double)offered : 0.0,
+                rs.in_use);
+    }
+    fprintf(stderr, "socket rcvbuf: %d bytes\n", cap->rcvbuf);
 
     memset(&ks, 0, sizeof(ks));
-    if (getsockopt(cap->fd, SOL_PACKET, PACKET_STATISTICS, &ks, &ks_len) == 0)
+    if (cap->rx != NULL) {
+        struct tpacket_stats_v3 kv3;
+        socklen_t kv3_len = sizeof(kv3);
+
+        memset(&kv3, 0, sizeof(kv3));
+        if (getsockopt(cap->fd, SOL_PACKET, PACKET_STATISTICS, &kv3,
+                       &kv3_len) == 0)
+            fprintf(stderr,
+                    "kernel: %u packets, %u dropped by socket, %u queue freezes\n",
+                    kv3.tp_packets, kv3.tp_drops, kv3.tp_freeze_q_cnt);
+    } else if (getsockopt(cap->fd, SOL_PACKET, PACKET_STATISTICS, &ks,
+                          &ks_len) == 0) {
         fprintf(stderr, "kernel: %u packets, %u dropped by socket\n",
                 ks.tp_packets, ks.tp_drops);
+    }
 }
 
 /* Returns 0, or -1 if the pcap file hit an error at any point. */
@@ -520,7 +651,10 @@ static void cleanup(struct capture *cap)
     feed_destroy(&cap->feed);
     ana_destroy(&cap->ana);
     rb_destroy(&cap->ring);
-    close(cap->fd);
+    rx_ring_close(cap->rx);
+    cap->rx = NULL;
+    if (cap->fd >= 0)
+        close(cap->fd);
 }
 
 int main(int argc, char **argv)
@@ -558,11 +692,33 @@ int main(int argc, char **argv)
 
     cap.opt = &opt;
     cap.tui = !opt.console;
-    cap.fd = open_capture_socket(&opt);
+    cap.fd = open_capture_socket(&cap.rcvbuf);
     if (cap.fd < 0)
         return EXIT_FAILURE;
 
-    if (rb_init(&cap.ring, opt.ring_slots) != 0) {
+    if (!opt.classic) {
+        cap.rx = rx_ring_open(cap.fd, opt.ring_slots * (size_t)MAX_PACKET_LEN);
+        if (cap.rx == NULL) {
+            fprintf(stderr, "tpacket_v3 unavailable (%s); using recvfrom\n",
+                    strerror(errno));
+            close(cap.fd);
+            cap.fd = open_capture_socket(&cap.rcvbuf);
+            if (cap.fd < 0)
+                return EXIT_FAILURE;
+        }
+    }
+    /* The mapped ring must be installed before bind. ifindex 0 (all
+     * interfaces) is required for that path; the recvfrom path stays
+     * unbound unless -i was given, as before. */
+    if (cap.rx != NULL || opt.iface != NULL) {
+        if (bind_capture(cap.fd, opt.iface, opt.promisc) != 0) {
+            rx_ring_close(cap.rx);
+            close(cap.fd);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (cap.rx == NULL && rb_init(&cap.ring, opt.ring_slots) != 0) {
         perror("ring buffer");
         close(cap.fd);
         return EXIT_FAILURE;
@@ -572,6 +728,7 @@ int main(int argc, char **argv)
     if (err != 0) {
         fprintf(stderr, "analyzer: %s\n", strerror(err));
         rb_destroy(&cap.ring);
+        rx_ring_close(cap.rx);
         close(cap.fd);
         return EXIT_FAILURE;
     }
@@ -580,6 +737,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "feed: %s\n", strerror(err));
         ana_destroy(&cap.ana);
         rb_destroy(&cap.ring);
+        rx_ring_close(cap.rx);
         close(cap.fd);
         return EXIT_FAILURE;
     }
@@ -598,8 +756,10 @@ int main(int argc, char **argv)
 
     if (cap.tui) {
         struct ui_config uc = {
-            .ana = &cap.ana, .feed = &cap.feed, .ring = &cap.ring,
+            .ana = &cap.ana, .feed = &cap.feed,
+            .ring = cap.rx != NULL ? NULL : &cap.ring,
             .iface = opt.iface, .pcap_path = opt.pcap_path,
+            .ingest = cap.rx != NULL ? "tpacket" : "recvfrom",
             .stop = &g_stop, .resize = &g_resize,
         };
 
@@ -608,11 +768,25 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
     } else {
-        fprintf(stderr, "capturing on %s%s, %zu ring slots%s%s (Ctrl-C to stop)\n",
-                opt.iface ? opt.iface : "all interfaces",
-                opt.promisc ? " [promiscuous]" : "", cap.ring.capacity,
-                opt.pcap_path ? ", writing " : "",
-                opt.pcap_path ? opt.pcap_path : "");
+        if (cap.rx != NULL) {
+            struct rx_info ri;
+
+            rx_ring_get_info(cap.rx, &ri);
+            fprintf(stderr,
+                    "capturing on %s%s, tpacket_v3 %u x %u KiB%s%s (Ctrl-C to stop)\n",
+                    opt.iface ? opt.iface : "all interfaces",
+                    opt.promisc ? " [promiscuous]" : "", ri.blocks,
+                    ri.block_size / 1024u,
+                    opt.pcap_path ? ", writing " : "",
+                    opt.pcap_path ? opt.pcap_path : "");
+        } else {
+            fprintf(stderr,
+                    "capturing on %s%s, recvfrom %zu ring slots%s%s (Ctrl-C to stop)\n",
+                    opt.iface ? opt.iface : "all interfaces",
+                    opt.promisc ? " [promiscuous]" : "", cap.ring.capacity,
+                    opt.pcap_path ? ", writing " : "",
+                    opt.pcap_path ? opt.pcap_path : "");
+        }
     }
 
     err = pthread_create(&worker, NULL, worker_thread, &cap);

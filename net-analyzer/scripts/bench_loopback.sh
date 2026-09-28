@@ -4,12 +4,17 @@
 #
 # usage: sudo scripts/bench_loopback.sh [SECONDS]
 # env:   SLOTS="8 256 1024"  PORT=45201  BIN=build/net-analyzer
+#        CLASSIC=1  force the recvfrom path (-R) instead of TPACKET_V3
 set -eu
 
 SECS=${1:-5}
 SLOTS=${SLOTS:-"8 256 1024"}
 PORT=${PORT:-45201}
 BIN=${BIN:-build/net-analyzer}
+CLASSIC_FLAG=
+if [ "${CLASSIC:-0}" = 1 ]; then
+    CLASSIC_FLAG=-R
+fi
 
 command -v iperf3 >/dev/null || { echo "iperf3 not installed" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "$BIN missing; run make first" >&2; exit 1; }
@@ -19,9 +24,9 @@ run() {   # run LABEL SLOTS OUTPUT_MODE IPERF_ARGS...
     shift 3
     log=$(mktemp)
     if [ "$mode" = quiet ]; then
-        "$BIN" -i lo -q -b "$slots" 2>"$log" &
+        "$BIN" -i lo -q -b "$slots" $CLASSIC_FLAG 2>"$log" &
     else
-        "$BIN" -i lo -b "$slots" >/dev/null 2>"$log" &
+        "$BIN" -i lo -b "$slots" $CLASSIC_FLAG >/dev/null 2>"$log" &
     fi
     pid=$!
     sleep 0.5
@@ -34,7 +39,7 @@ run() {   # run LABEL SLOTS OUTPUT_MODE IPERF_ARGS...
     kill -INT "$pid"
     wait "$pid" || true
     printf '%-22s slots=%-5s output=%-6s iperf3=%s\n' "$label" "$slots" "$mode" "$rate"
-    grep -E '^(ring|kernel)' "$log" | sed 's/^/    /'
+    grep -E '^(ingest|ring|kernel|socket)' "$log" | sed 's/^/    /'
     rm -f "$log"
 }
 

@@ -3,10 +3,11 @@
 A raw-socket packet sniffer and protocol analyzer for Linux, written in C11.
 It captures Ethernet frames with `AF_PACKET`, dissects L2/L3/L4 headers with
 strict bounds checking, and shows them on an ncurses dashboard (or as plain
-text). Capture and dissection run on separate threads connected by a lockless
-ring buffer. A third thread renders the dashboard. It keeps live traffic
-statistics, flags SYN port scans, and can write a standard `.pcap` file
-without linking libpcap.
+text). By default the kernel writes frames into a memory-mapped `TPACKET_V3`
+ring and the dissector reads them in place. `-R` falls back to `recvfrom`
+into a lockless user-space ring. A third thread renders the dashboard. It
+keeps live traffic statistics, flags SYN port scans, and can write a standard
+`.pcap` file without linking libpcap.
 
 ![net-analyzer dashboard on loopback, with a port-scan alert](docs/tui-demo.png)
 
@@ -21,7 +22,7 @@ without linking libpcap.
 
 ## Status
 
-The roadmap is complete:
+The roadmap is complete through phase 5:
 
 | Phase | What it adds |
 |-------|----------------|
@@ -29,6 +30,7 @@ The roadmap is complete:
 | 2 | Lockless single-producer/single-consumer ring and a two-thread pipeline |
 | 3 | Shared traffic metrics and a sliding-window SYN port-scan detector |
 | 4 | libpcap-format writer (`-w`) and the ncurses dashboard on its own thread |
+| 5 | `TPACKET_V3` mapped ring (zero-copy ingest) and an 8 MiB socket receive buffer |
 
 | Layer | Supported |
 |-------|-----------|
@@ -44,7 +46,8 @@ not parsed.
 ## Architecture
 
 ```
-AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer ──> [Thread 2: dissector]
+AF_PACKET + TPACKET_V3 mmap ──> [Thread 1: hand blocks] ──> [Thread 2: dissector]
+AF_PACKET recvfrom (-R) ──────> [Thread 1: copy] ──> user ring ──> same dissector
                                                                           parse_packet
                                                                           ana_record ──> shared metrics
                                                                           det_observe ─> alert ring
@@ -55,6 +58,20 @@ AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer
     ana_tick (rates), -s stats, resize flag, stop + join
 ```
 
+- **Mapped ring** (`src/rx_ring.c`): the default ingest path. The socket is
+  switched to `TPACKET_V3` and a shared mapping of a few large blocks (up to
+  4 MiB each, sized from `-b` so the budget matches the old `slots × 64 KiB`
+  ring, at least two blocks). Thread 1 waits until a block is `TP_STATUS_USER`
+  and hands it to Thread 2. Thread 2 walks the frames in place and retires
+  the block. A block is owned by only one side, so the dissector never reads
+  a block the kernel is filling. `-b` still means that budget; `-R` skips
+  this path. If the ring cannot be installed, the program says so and uses
+  `recvfrom`.
+- **Receive buffer:** both paths request an 8 MiB `SO_RCVBUF`
+  (`SO_RCVBUFFORCE` when the process may exceed `rmem_max`). The kernel
+  reports twice that value. On the mapped path the mapping itself is the
+  queue; the larger socket buffer is what keeps the `recvfrom` fallback from
+  overflowing on jumbo loopback frames.
 - **Ring buffer** (`src/ring_buffer.c`): a single-producer / single-consumer
   ring with a power-of-two number of slots. Each slot holds a full
   `MAX_PACKET_LEN` (64 KiB) frame plus its captured length, on-wire length,
@@ -62,12 +79,14 @@ AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer
   `mmap(MAP_POPULATE)` at startup, so the hot path never calls `malloc` and
   never page-faults. Head and tail are C11 atomics on separate cache lines,
   with acquire/release ordering, and each side caches the other's index.
-- **Thread 1** reserves a slot and calls `recvfrom` directly into it, so there
-  is one copy per frame. If the ring is full, the frame is read into a scratch
-  buffer. If a slot has freed up by the time `recvfrom` returns, the frame is
-  copied into it. Otherwise it is counted as a ring drop.
-- **Thread 2** pops slots, parses and prints them, then releases them. When
-  the ring is empty it yields, then sleeps for 100 µs.
+- **Thread 1** on the mapped path only polls the socket and publishes ready
+  blocks. On `-R` it reserves a slot and calls `recvfrom` directly into it,
+  so there is one copy per frame. If that ring is full, the frame is read
+  into a scratch buffer. If a slot has freed up by the time `recvfrom`
+  returns, the frame is copied into it. Otherwise it is counted as a ring drop.
+- **Thread 2** parses and prints each frame, then releases it (a user-ring
+  slot, or, once the block is finished, the mapped block). When nothing is
+  waiting it yields, then sleeps for 100 µs.
 - **Metrics** (`src/analyzer.c`): Thread 2 counts every frame: packets,
   on-wire bytes, TCP / UDP / ICMP / Other, and ok / truncated / malformed.
   The counters are C11 atomics with a single writer, published under a
@@ -99,7 +118,8 @@ AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer
   restore the terminal before the summary is printed.
 - **Signals**: `SIGINT`, `SIGTERM` and `SIGWINCH` are blocked in every
   thread, and the main thread alone receives them with `sigtimedwait`. On a
-  stop request, Thread 1 exits within one 250 ms `SO_RCVTIMEO` tick. Thread 2
+  stop request, Thread 1 exits within one 250 ms `SO_RCVTIMEO` or `poll`
+  tick. Thread 2
   then drains whatever is still queued, the UI thread exits within one
   frame, the terminal is restored, and the program prints a summary and
   exits with code 0.
@@ -137,6 +157,7 @@ sudo ./build/net-analyzer -i eth0 -p         # eth0 in promiscuous mode
 sudo ./build/net-analyzer -i eth0 -w eth0.pcap
 sudo ./build/net-analyzer -c 100             # all interfaces, stop after 100 packets
 sudo ./build/net-analyzer -i lo -n -q -b 1024
+sudo ./build/net-analyzer -i lo -R -n -q     # recvfrom path, for comparison
 sudo ./build/net-analyzer -i eth0 -n -q -s   # console, alerts only, stats every second
 ```
 
@@ -148,12 +169,13 @@ mode), which is what you want from a script or a pipe.
 |------------|---------|
 | `-i IFACE` | Capture only on `IFACE`. By default all interfaces are captured |
 | `-c COUNT` | Stop after `COUNT` packets |
-| `-b SLOTS` | Ring buffer slots, rounded up to a power of two, 2 to 16384 (default 256, which is 16 MiB) |
+| `-b SLOTS` | Capture budget in 64 KiB units, 2 to 16384 (default 256, which is 16 MiB). On the mapped path this is the size of the kernel ring. On `-R` it is the user-ring slot count, rounded up to a power of two |
 | `-w FILE`  | Also write every captured frame to `FILE` in classic libpcap format |
 | `-p`       | Enable promiscuous mode on `IFACE` (requires `-i`) |
 | `-n`       | Console mode: one line per packet instead of the dashboard |
 | `-q`       | Console mode, quiet: dissect and count packets but do not print them. Alerts are still printed |
 | `-s`       | Console mode, plus a traffic stats line (rates, totals, protocol mix, alerts) on stderr every second |
+| `-R`       | Use `recvfrom` and the user-space ring instead of `TPACKET_V3` |
 | `-h`       | Show help |
 
 In the dashboard: `q` quits, Up/Down or `j`/`k` scroll one row, Page Up/Page
@@ -240,7 +262,7 @@ sudo nmap -sS -Pn -p 1-1000 127.0.0.1
 
 ```sh
 cd net-analyzer
-make test               # parser, ring, detector, analyzer, pcap writer, feed
+make test               # parser, ring, rx ring, detector, analyzer, pcap writer, feed
 make sanitize           # the same tests under AddressSanitizer + UBSan
 make tsan               # the threaded tests (ring, analyzer, feed) under ThreadSanitizer
 ```
@@ -288,6 +310,12 @@ buffer, and check that a write error becomes sticky and is reported by
 `pcap_close`. A live capture on `lo` was also opened with `tcpdump -r`,
 `tshark -r` and `capinfos` (Ethernet, microsecond timestamps, snaplen 65535).
 
+The mapped-ring tests walk synthetic `TPACKET_V3` blocks (two frames, a
+header that falls outside the block, a snaplen that has to be clamped) and
+run a two-thread handoff that refills a block only after it is retired. A
+live loopback capture runs when the test is allowed to open an `AF_PACKET`
+socket.
+
 The feed tests check incremental polling, overflow keeping the newest 1024
 entries, and the column layout of `feed_format`. A two-thread stress test
 checks that every entry a reader observes matches what the writer pushed.
@@ -308,7 +336,9 @@ make && sudo scripts/bench_loopback.sh 5          # SLOTS="8 256 1024" by defaul
 ```
 
 Results from a 4-vCPU cloud VM (Intel Xeon, kernel 6.12, iperf3 3.16), with
-iperf3 running on the same machine, 5 seconds per run. `TCP max` is a single
+iperf3 running on the same machine, 5 seconds per run, on the phase 2
+`recvfrom` path (today: `CLASSIC=1` / `-R`) and the small default socket
+buffer of that phase. `TCP max` is a single
 TCP stream at full speed; loopback GSO produces frames of up to 64 KiB, at
 about 54 Gbit/s. `UDP 64B` is `-u -b 0 -l 64`, the smallest frames at the
 highest packet rate, about 100 Mbit/s of payload. Frames per run were about
@@ -345,22 +375,47 @@ What this shows:
 - Run-to-run variance is several percentage points, because iperf3 shares the
   same 4 vCPUs. Treat the numbers as orders of magnitude.
 
-The next steps for ingestion are a larger `SO_RCVBUF` and, eventually, a
-`PACKET_RX_RING` (TPACKET_V3) memory-mapped ring to remove the per-frame
-syscall and copy.
+Phase 5 is that next step. The default path is a `TPACKET_V3` ring, so
+Thread 1 no longer pays a `recvfrom` and a copy per frame, and the socket
+receive buffer is 8 MiB on every path. Pass `CLASSIC=1` to
+`scripts/bench_loopback.sh` to measure the `recvfrom` path (`-R`). The
+numbers above are that path with the small default socket buffer from phase 2.
+
+A later 3-second run on the same kind of 4-vCPU VM, with the 8 MiB buffer on
+both paths and `-b 256` (16 MiB of ring). Loss is kernel drops plus user-ring
+drops, over every frame the socket saw. `TPACKET_V3` has no user-ring copy.
+
+| Traffic | Path | iperf3 | Loss |
+|---------|------|-------:|-----:|
+| TCP max, quiet | tpacket_v3 | 38.9 Gbit/s | 2.0% |
+| TCP max, /dev/null | tpacket_v3 | 39.4 Gbit/s | 1.2% |
+| UDP 64B, quiet | tpacket_v3 | 197 Mbit/s | 0 |
+| UDP 64B, /dev/null | tpacket_v3 | 159 Mbit/s | 0 |
+| TCP max, quiet | recvfrom `-R` | 59.0 Gbit/s | 7.6% |
+| TCP max, /dev/null | recvfrom `-R` | 61.1 Gbit/s | 9.9% |
+| UDP 64B, quiet | recvfrom `-R` | 114 Mbit/s | 1.6% |
+| UDP 64B, /dev/null | recvfrom `-R` | 150 Mbit/s | 14.6% |
+
+The mapped ring dropped nothing in the program itself. The TCP loss that
+remains is the kernel freezing the ring a few times (8 and 15 freezes in
+these two runs) while the dissector held every block. The `recvfrom` path
+with the larger buffer still loses more of a full-speed TCP stream, and
+printing small UDP frames still overflows its 256 slots. iperf3 shares the
+same CPUs, so the lower TCP rate beside `tpacket_v3` is the capture path
+using more of the machine, not a slower link.
 
 ## Layout
 
 ```
 net-analyzer/
 ├── Makefile, CMakeLists.txt
-├── include/   parser.h, ring_buffer.h, detector.h, analyzer.h, feed.h,
-│              pcap_writer.h, ui.h, config.h
-├── src/       main.c (threads, signals), parser.c, ring_buffer.c,
+├── include/   parser.h, ring_buffer.h, rx_ring.h, detector.h, analyzer.h,
+│              feed.h, pcap_writer.h, ui.h, config.h
+├── src/       main.c (threads, signals), parser.c, ring_buffer.c, rx_ring.c,
 │              detector.c, analyzer.c, feed.c, pcap_writer.c, ui.c
 ├── scripts/   bench_loopback.sh (iperf3 drop-rate benchmark)
-└── tests/     test_parser.c, test_ring_buffer.c, test_detector.c,
-               test_analyzer.c, test_pcap_writer.c, test_feed.c
+└── tests/     test_parser.c, test_ring_buffer.c, test_rx_ring.c,
+               test_detector.c, test_analyzer.c, test_pcap_writer.c, test_feed.c
 ```
 
 ## License
