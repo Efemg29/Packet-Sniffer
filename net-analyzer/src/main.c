@@ -1,5 +1,6 @@
 #include "config.h"
 #include "parser.h"
+#include "ring_buffer.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -7,7 +8,10 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,15 +21,17 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_stop;
+#define DEFAULT_RING_SLOTS 256
 
-/* Static so the hot path never allocates. */
-static uint8_t g_frame[MAX_PACKET_LEN];
+/* Set by the signal thread, by the worker on -c, or on a fatal error. */
+static atomic_int g_stop;
 
 struct options {
     const char *iface;
     unsigned long long max_packets;   /* 0 = unlimited */
+    size_t ring_slots;
     int promisc;
+    int quiet;
 };
 
 struct counters {
@@ -35,24 +41,29 @@ struct counters {
     unsigned long long malformed;
 };
 
-static void on_signal(int sig)
+struct capture {
+    int fd;
+    const struct options *opt;
+    struct ring_buffer ring;
+    atomic_int ingest_done;
+    int ingest_rc;
+    struct counters ctr;              /* written by the worker only */
+};
+
+/*
+ * Receive target when the ring is full. Static so the hot path never
+ * allocates; only the ingestion thread touches it.
+ */
+static uint8_t g_overflow[MAX_PACKET_LEN];
+
+static void request_stop(void)
 {
-    (void)sig;
-    g_stop = 1;
+    atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
 }
 
-static int install_signal_handlers(void)
+static int stop_requested(void)
 {
-    struct sigaction sa;
-
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-    /* No SA_RESTART: recvfrom() must return EINTR so the loop can exit. */
-    sa.sa_flags = 0;
-    if (sigaction(SIGINT, &sa, NULL) != 0 || sigaction(SIGTERM, &sa, NULL) != 0)
-        return -1;
-    return 0;
+    return atomic_load_explicit(&g_stop, memory_order_relaxed);
 }
 
 static int has_cap_net_raw(void)
@@ -76,12 +87,14 @@ static int has_cap_net_raw(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-i IFACE] [-c COUNT] [-p] [-h]\n"
+            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-p] [-q] [-h]\n"
             "  -i IFACE  capture only on IFACE (default: all interfaces)\n"
             "  -c COUNT  stop after COUNT packets\n"
+            "  -b SLOTS  ring buffer slots, 64 KiB each (default: %d)\n"
             "  -p        put IFACE into promiscuous mode (requires -i)\n"
+            "  -q        quiet: dissect but do not print packets\n"
             "  -h        show this help\n",
-            prog);
+            prog, DEFAULT_RING_SLOTS);
 }
 
 static int parse_args(int argc, char **argv, struct options *opt)
@@ -90,7 +103,8 @@ static int parse_args(int argc, char **argv, struct options *opt)
     char *end;
 
     memset(opt, 0, sizeof(*opt));
-    while ((c = getopt(argc, argv, "i:c:ph")) != -1) {
+    opt->ring_slots = DEFAULT_RING_SLOTS;
+    while ((c = getopt(argc, argv, "i:c:b:pqh")) != -1) {
         switch (c) {
         case 'i':
             opt->iface = optarg;
@@ -103,8 +117,24 @@ static int parse_args(int argc, char **argv, struct options *opt)
                 return -1;
             }
             break;
+        case 'b': {
+            unsigned long long v;
+
+            errno = 0;
+            v = strtoull(optarg, &end, 10);
+            if (errno != 0 || *end != '\0' || end == optarg ||
+                optarg[0] == '-' || v < 2 || v > 16384) {
+                fprintf(stderr, "invalid slot count (2..16384): %s\n", optarg);
+                return -1;
+            }
+            opt->ring_slots = (size_t)v;
+            break;
+        }
         case 'p':
             opt->promisc = 1;
+            break;
+        case 'q':
+            opt->quiet = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -135,8 +165,8 @@ static int open_capture_socket(const struct options *opt)
         return -1;
     }
 
-    /* Bounds how long a signal can go unnoticed if it lands between the
-     * g_stop check and recvfrom(). */
+    /* Bounds how long the ingestion thread can block before it re-checks
+     * g_stop. */
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
         perror("setsockopt(SO_RCVTIMEO)");
         close(fd);
@@ -181,17 +211,16 @@ static int open_capture_socket(const struct options *opt)
     return fd;
 }
 
-static void print_packet(const struct pkt_info *info, int outgoing)
+static void print_packet(const struct rb_slot *s, const struct pkt_info *info)
 {
-    struct timespec ts;
     struct tm tm;
     char line[256];
 
-    clock_gettime(CLOCK_REALTIME, &ts);
-    localtime_r(&ts.tv_sec, &tm);
+    localtime_r(&s->ts.tv_sec, &tm);
     pkt_format(info, line, sizeof(line));
     printf("%02d:%02d:%02d.%06ld %-3s %s\n", tm.tm_hour, tm.tm_min,
-           tm.tm_sec, ts.tv_nsec / 1000L, outgoing ? "OUT" : "IN", line);
+           tm.tm_sec, s->ts.tv_nsec / 1000L,
+           s->pkttype == PACKET_OUTGOING ? "OUT" : "IN", line);
 }
 
 static void count(struct counters *c, enum pkt_status st)
@@ -205,42 +234,158 @@ static void count(struct counters *c, enum pkt_status st)
     }
 }
 
-static int capture_loop(int fd, const struct options *opt,
-                        struct counters *ctr)
+static void fill_slot(struct rb_slot *s, size_t wire_len,
+                      const struct sockaddr_ll *from)
 {
-    struct pkt_info info;
+    s->cap_len = (uint32_t)(wire_len < MAX_PACKET_LEN ? wire_len
+                                                      : MAX_PACKET_LEN);
+    s->orig_len = wire_len > UINT32_MAX ? UINT32_MAX : (uint32_t)wire_len;
+    s->pkttype = from->sll_pkttype;
+    clock_gettime(CLOCK_REALTIME, &s->ts);
+}
 
-    while (!g_stop) {
+/* Thread 1: socket -> ring. The only producer. */
+static void *ingest_thread(void *arg)
+{
+    struct capture *cap = arg;
+    struct ring_buffer *rb = &cap->ring;
+
+    while (!stop_requested()) {
         struct sockaddr_ll from;
         socklen_t from_len = sizeof(from);
+        struct rb_slot *slot = rb_reserve(rb);
+        uint8_t *dst = slot != NULL ? slot->data : g_overflow;
         ssize_t n;
-        size_t cap;
 
-        n = recvfrom(fd, g_frame, sizeof(g_frame), MSG_TRUNC,
+        n = recvfrom(cap->fd, dst, MAX_PACKET_LEN, MSG_TRUNC,
                      (struct sockaddr *)&from, &from_len);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             perror("recvfrom");
-            return -1;
+            cap->ingest_rc = -1;
+            request_stop();
+            break;
         }
 
-        /* With MSG_TRUNC, n is the on-wire length and may exceed the buffer. */
-        cap = (size_t)n < sizeof(g_frame) ? (size_t)n : sizeof(g_frame);
-        count(ctr, parse_packet(g_frame, cap, &info));
-        print_packet(&info, from.sll_pkttype == PACKET_OUTGOING);
-
-        if (opt->max_packets != 0 && ctr->seen >= opt->max_packets)
-            break;
+        if (slot == NULL) {
+            /* The ring was full when we started waiting; the worker may have
+             * freed a slot while we were blocked in recvfrom(). */
+            slot = rb_reserve(rb);
+            if (slot == NULL) {
+                rb_record_drop(rb);
+                continue;
+            }
+            memcpy(slot->data, g_overflow,
+                   (size_t)n < MAX_PACKET_LEN ? (size_t)n : MAX_PACKET_LEN);
+        }
+        fill_slot(slot, (size_t)n, &from);
+        rb_commit(rb);
     }
-    return 0;
+
+    atomic_store_explicit(&cap->ingest_done, 1, memory_order_release);
+    return NULL;
+}
+
+static void idle_backoff(unsigned *spins)
+{
+    static const struct timespec nap = { 0, 100000 };   /* 100 us */
+
+    if (*spins < 64) {
+        (*spins)++;
+        sched_yield();
+    } else {
+        nanosleep(&nap, NULL);
+    }
+}
+
+/* Thread 2: ring -> parser -> stdout. The only consumer. */
+static void *worker_thread(void *arg)
+{
+    struct capture *cap = arg;
+    struct ring_buffer *rb = &cap->ring;
+    const struct options *opt = cap->opt;
+    struct pkt_info info;
+    unsigned spins = 0;
+
+    for (;;) {
+        const struct rb_slot *s = rb_peek(rb);
+
+        if (s == NULL) {
+            /* Drain everything already queued before exiting. */
+            if (atomic_load_explicit(&cap->ingest_done, memory_order_acquire) &&
+                (s = rb_peek(rb)) == NULL)
+                break;
+            if (s == NULL) {
+                idle_backoff(&spins);
+                continue;
+            }
+        }
+        spins = 0;
+
+        count(&cap->ctr, parse_packet(s->data, s->cap_len, &info));
+        if (!opt->quiet)
+            print_packet(s, &info);
+        rb_release(rb);
+
+        if (opt->max_packets != 0 && cap->ctr.seen >= opt->max_packets) {
+            request_stop();
+            break;
+        }
+    }
+    fflush(stdout);
+    return NULL;
+}
+
+/*
+ * Runs on the main thread with SIGINT/SIGTERM blocked process-wide, so it is
+ * the only place those signals are ever handled.
+ */
+static void wait_for_stop(const sigset_t *set)
+{
+    static const struct timespec tick = { 0, 100000000 };  /* 100 ms */
+
+    while (!stop_requested()) {
+        int sig = sigtimedwait(set, NULL, &tick);
+
+        if (sig == SIGINT || sig == SIGTERM)
+            request_stop();
+    }
+}
+
+static void print_summary(struct capture *cap)
+{
+    struct rb_stats rs;
+    struct tpacket_stats ks;
+    socklen_t ks_len = sizeof(ks);
+    unsigned long long offered;
+
+    rb_get_stats(&cap->ring, &rs);
+    offered = (unsigned long long)(rs.pushed + rs.dropped);
+
+    fprintf(stderr,
+            "\n%llu packets dissected: %llu ok, %llu truncated, %llu malformed\n",
+            cap->ctr.seen, cap->ctr.ok, cap->ctr.truncated, cap->ctr.malformed);
+    fprintf(stderr,
+            "ring (%zu slots): %llu queued, %llu dropped (%.3f%%), %zu left unprocessed\n",
+            cap->ring.capacity, (unsigned long long)rs.pushed,
+            (unsigned long long)rs.dropped,
+            offered ? 100.0 * (double)rs.dropped / (double)offered : 0.0,
+            rs.in_use);
+
+    memset(&ks, 0, sizeof(ks));
+    if (getsockopt(cap->fd, SOL_PACKET, PACKET_STATISTICS, &ks, &ks_len) == 0)
+        fprintf(stderr, "kernel: %u packets, %u dropped by socket\n",
+                ks.tp_packets, ks.tp_drops);
 }
 
 int main(int argc, char **argv)
 {
     struct options opt;
-    struct counters ctr;
-    int fd, rc;
+    static struct capture cap;
+    pthread_t ingest, worker;
+    sigset_t sigs;
+    int err;
 
     if (parse_args(argc, argv, &opt) != 0) {
         usage(argv[0]);
@@ -255,26 +400,57 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (install_signal_handlers() != 0) {
-        perror("sigaction");
+    /* Block before spawning threads so they inherit the mask and the main
+     * thread's sigtimedwait() is the sole receiver. */
+    sigemptyset(&sigs);
+    sigaddset(&sigs, SIGINT);
+    sigaddset(&sigs, SIGTERM);
+    err = pthread_sigmask(SIG_BLOCK, &sigs, NULL);
+    if (err != 0) {
+        fprintf(stderr, "pthread_sigmask: %s\n", strerror(err));
         return EXIT_FAILURE;
     }
 
-    fd = open_capture_socket(&opt);
-    if (fd < 0)
+    cap.opt = &opt;
+    cap.fd = open_capture_socket(&opt);
+    if (cap.fd < 0)
         return EXIT_FAILURE;
 
-    fprintf(stderr, "capturing on %s%s (Ctrl-C to stop)\n",
+    if (rb_init(&cap.ring, opt.ring_slots) != 0) {
+        perror("ring buffer");
+        close(cap.fd);
+        return EXIT_FAILURE;
+    }
+    atomic_init(&cap.ingest_done, 0);
+
+    fprintf(stderr, "capturing on %s%s, %zu ring slots (Ctrl-C to stop)\n",
             opt.iface ? opt.iface : "all interfaces",
-            opt.promisc ? " [promiscuous]" : "");
+            opt.promisc ? " [promiscuous]" : "", cap.ring.capacity);
 
-    memset(&ctr, 0, sizeof(ctr));
-    rc = capture_loop(fd, &opt, &ctr);
+    err = pthread_create(&worker, NULL, worker_thread, &cap);
+    if (err == 0) {
+        err = pthread_create(&ingest, NULL, ingest_thread, &cap);
+        if (err != 0) {
+            atomic_store(&cap.ingest_done, 1);
+            pthread_join(worker, NULL);
+        }
+    }
+    if (err != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(err));
+        rb_destroy(&cap.ring);
+        close(cap.fd);
+        return EXIT_FAILURE;
+    }
 
-    close(fd);
+    wait_for_stop(&sigs);
+
+    /* Ingestion exits within one SO_RCVTIMEO tick; the worker then drains. */
+    pthread_join(ingest, NULL);
+    pthread_join(worker, NULL);
+
     fflush(stdout);
-    fprintf(stderr,
-            "\n%llu packets captured: %llu ok, %llu truncated, %llu malformed\n",
-            ctr.seen, ctr.ok, ctr.truncated, ctr.malformed);
-    return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    print_summary(&cap);
+    rb_destroy(&cap.ring);
+    close(cap.fd);
+    return cap.ingest_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
