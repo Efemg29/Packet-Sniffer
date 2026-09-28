@@ -8,10 +8,10 @@ LDFLAGS  += -pthread
 
 BUILD    := build
 BIN      := $(BUILD)/net-analyzer
-TESTS    := test_parser test_ring_buffer
+TESTS    := test_parser test_ring_buffer test_detector test_analyzer
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
-LIB_SRCS := src/parser.c src/ring_buffer.c
+LIB_SRCS := src/parser.c src/ring_buffer.c src/detector.c src/analyzer.c
 APP_SRCS := src/main.c $(LIB_SRCS)
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o)
@@ -44,11 +44,13 @@ sanitize:
 	$(MAKE) BUILD=$(BUILD)/sanitize CFLAGS="$(SAN_FLAGS)" \
 	        LDFLAGS="-pthread -fsanitize=address,undefined" test
 
-# Ring buffer tests (incl. the producer/consumer stress test) under TSan.
+# Threaded tests (ring producer/consumer, analyzer writer/readers) under TSan.
 tsan:
 	$(MAKE) BUILD=$(BUILD)/tsan CFLAGS="$(TSAN_FLAGS)" \
-	        LDFLAGS="-pthread -fsanitize=thread" $(BUILD)/tsan/test_ring_buffer
+	        LDFLAGS="-pthread -fsanitize=thread" \
+	        $(BUILD)/tsan/test_ring_buffer $(BUILD)/tsan/test_analyzer
 	RB_STRESS_ITERS=200000 ./$(BUILD)/tsan/test_ring_buffer
+	ANA_STRESS_ITERS=200000 ./$(BUILD)/tsan/test_analyzer
 
 clean:
 	rm -rf $(BUILD)

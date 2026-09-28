@@ -3,7 +3,8 @@
 A raw-socket packet sniffer and protocol analyzer for Linux, written in C11.
 It captures Ethernet frames with `AF_PACKET`, dissects L2/L3/L4 headers with
 strict bounds checking, and prints one line per packet. Capture and
-dissection run on separate threads connected by a lockless ring buffer.
+dissection run on separate threads connected by a lockless ring buffer. It
+keeps live traffic statistics and flags SYN port scans as they happen.
 
 ```
 16:53:19.374512 OUT ICMP 127.0.0.1 -> 127.0.0.1 len=98 ttl=64 type=8 code=0 payload=56
@@ -11,14 +12,16 @@ dissection run on separate threads connected by a lockless ring buffer.
 16:53:20.430572 OUT TCP  127.0.0.1:42062 -> 127.0.0.1:47123 len=74 ttl=64 flags=[S] payload=0
 16:53:20.430580 OUT TCP  127.0.0.1:47123 -> 127.0.0.1:42062 len=74 ttl=64 flags=[SA] payload=0
 16:53:20.430584 OUT TCP  127.0.0.1:42062 -> 127.0.0.1:47123 len=84 ttl=64 flags=[PA] payload=18
+17:22:08.798751 !!! ALERT PORT_SCAN_DETECTED src=127.0.0.1 syns=31 ports=31 window=1.0s last_dport=400
 ```
 
 ## Status
 
-Phases 1 and 2 of the roadmap are done: the protocol dissector, and a
-two-thread capture pipeline built on a lockless ring buffer. The port-scan
-detector, PCAP export, and the ncurses dashboard are planned. Their headers
-under `net-analyzer/include/` are placeholders for now.
+Phases 1 to 3 of the roadmap are done: the protocol dissector, a two-thread
+capture pipeline built on a lockless ring buffer, and the analytics layer
+(shared traffic metrics and a sliding-window port-scan detector). PCAP export
+and the ncurses dashboard are planned; `pcap_writer.h` and `ui.h` are
+placeholders for now.
 
 | Layer | Supported |
 |-------|-----------|
@@ -36,7 +39,9 @@ not parsed.
 ```
 AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer ──> [Thread 2: dissector] ──> stdout
                                                                           parse_packet + print
-[main thread: sigtimedwait(SIGINT, SIGTERM)] ── sets stop flag, joins both threads
+                                                                          ana_record ──> shared metrics
+                                                                          det_observe ─> alerts
+[main thread: sigtimedwait(SIGINT, SIGTERM), 100 ms tick] ── ana_tick (rates), -s stats, stop + join
 ```
 
 - **Ring buffer** (`src/ring_buffer.c`): a single-producer / single-consumer
@@ -52,6 +57,16 @@ AF_PACKET socket ──recvfrom──> [Thread 1: ingestion] ──> ring buffer
   copied into it. Otherwise it is counted as a ring drop.
 - **Thread 2** pops slots, parses and prints them, then releases them. When
   the ring is empty it yields, then sleeps for 100 µs.
+- **Metrics** (`src/analyzer.c`): Thread 2 counts every frame: packets,
+  on-wire bytes, TCP / UDP / ICMP / Other, and ok / truncated / malformed.
+  The counters are C11 atomics with a single writer, published under a
+  sequence lock, so `ana_snapshot()` returns a consistent set from any thread
+  (for example, packets always equals the sum of the protocol counts) without
+  ever blocking the dissector. The main thread calls `ana_tick()` every
+  100 ms. It keeps the last 11 samples and publishes packets/s and bytes/s
+  over the last second. Alerts go into a mutex-protected ring of the last 64,
+  which readers poll incrementally with `ana_alerts_since()`.
+- **Detector** (`src/detector.c`): see [Port-scan detection](#port-scan-detection).
 - **Signals**: `SIGINT` and `SIGTERM` are blocked in every thread, and the
   main thread alone receives them with `sigtimedwait`. On a stop request,
   Thread 1 exits within one 250 ms `SO_RCVTIMEO` tick. Thread 2 then drains
@@ -87,6 +102,7 @@ sudo ./build/net-analyzer -i lo              # loopback only
 sudo ./build/net-analyzer -i eth0 -p         # eth0 in promiscuous mode
 sudo ./build/net-analyzer -c 100             # all interfaces, stop after 100 packets
 sudo ./build/net-analyzer -i lo -q -b 1024   # no per-packet output, 1024-slot ring
+sudo ./build/net-analyzer -i eth0 -q -s      # alerts only, plus a stats line every second
 ```
 
 | Option     | Meaning |
@@ -95,7 +111,8 @@ sudo ./build/net-analyzer -i lo -q -b 1024   # no per-packet output, 1024-slot r
 | `-c COUNT` | Stop after `COUNT` packets |
 | `-b SLOTS` | Ring buffer slots, rounded up to a power of two, 2 to 16384 (default 256, which is 16 MiB) |
 | `-p`       | Enable promiscuous mode on `IFACE` (requires `-i`) |
-| `-q`       | Quiet: dissect and count packets but do not print them |
+| `-q`       | Quiet: dissect and count packets but do not print them. Alerts are still printed |
+| `-s`       | Print a traffic stats line (rates, totals, protocol mix, alerts) to stderr every second |
 | `-h`       | Show help |
 
 To run without sudo, grant the capability once:
@@ -109,10 +126,16 @@ socket, prints a summary and exits with code 0. On `lo` every packet appears
 twice, once as `OUT` and once as `IN`, because the kernel loops it back.
 
 ```
-3100 packets dissected: 3100 ok, 0 truncated, 0 malformed
-ring (8 slots): 3100 queued, 16 dropped (0.513%), 0 left unprocessed
-kernel: 3116 packets, 0 dropped by socket
+[stats] 3994 pkt/s 218.4 KB/s | total 9194 pkts 854216 bytes | TCP 99.8% UDP 0.0% ICMP 0.2% Other 0.0% | alerts 1
+...
+10004 packets dissected: 10004 ok, 0 truncated, 0 malformed
+traffic: 906886 bytes | TCP 9984, UDP 0, ICMP 20, Other 0
+detector: 1469 SYNs from 1 tracked sources, 0 evicted, 2 alerts
+ring (256 slots): 10004 queued, 0 dropped (0.000%), 0 left unprocessed
+kernel: 10004 packets, 0 dropped by socket
 ```
+
+The `[stats]` lines appear only with `-s`.
 
 `ring ... dropped` counts frames Thread 1 read but had no free slot for.
 `kernel ... dropped by socket` comes from `PACKET_STATISTICS` and counts frames
@@ -120,13 +143,60 @@ the kernel discarded because the socket receive buffer was full, meaning
 Thread 1 was not calling `recvfrom` fast enough. `left unprocessed` is
 non-zero only when `-c` stops the worker with frames still queued.
 
+## Port-scan detection
+
+The detector tracks, per IPv4 source address, the TCP connection attempts
+(SYN set, ACK clear) it sent in the last 1.0 seconds and how many distinct
+destination ports they targeted. A source is flagged `PORT_SCAN_DETECTED`
+when, within that sliding window, **more than 30 SYNs** hit **more than 20
+distinct ports**. Both conditions are required: a SYN flood against one
+service or a browser opening many connections to port 443 does not alert,
+and neither does a slow scan that stays under 31 SYNs per second.
+
+- **Sliding, not bucketed.** Each source keeps the timestamps of its recent
+  SYNs, and anything a full window old is expired on the next SYN. A burst
+  split across a whole-second boundary is still caught.
+- **Distinct ports** are kept incrementally in a small per-source hash
+  multiset, updated as SYNs enter and leave the window, so each packet costs
+  O(1).
+- **Fixed memory.** The table holds 1024 sources (about 2.4 MiB, allocated
+  once at startup). Lookup uses hash chains. When the table is full, the
+  least recently active source is evicted, so a flood of one-off spoofed
+  sources cannot push out an active scanner. Each source remembers its last
+  128 SYNs, so the reported `syns=` saturates at 128, far above the threshold.
+- **One alert per episode.** A source alerts when it first crosses both
+  thresholds. While it stays above them it is re-reported at most every
+  5 seconds. Once it drops below either threshold it is re-armed.
+- Only frames the host received are checked. `OUT` frames are skipped, so
+  loopback traffic, which is captured once as `OUT` and once as `IN`, is not
+  counted twice. As a result, scans this host sends to other machines are
+  not flagged.
+- Timestamps are the capture times of the frames. If the wall clock steps
+  backwards, the detector clamps to the latest time it has seen.
+
+Validated live on `lo` (4-vCPU VM, nmap 7.94):
+
+| Traffic | Result |
+|---------|--------|
+| 200 HTTP requests to one port, 8 other ports, `ping` | no alert |
+| `nmap -sS --scan-delay 100ms -p 2000-2059` (10 SYN/s) | no alert |
+| `nmap -sS -p 1-1000 127.0.0.1` | alert at the 31st SYN |
+| `nmap -sT -p 3000-3200 127.0.0.1` (connect scan) | alert |
+
+To try it yourself:
+
+```sh
+sudo ./build/net-analyzer -i lo -q -s &
+sudo nmap -sS -Pn -p 1-1000 127.0.0.1
+```
+
 ## Test
 
 ```sh
 cd net-analyzer
-make test               # parser and ring buffer unit tests
+make test               # parser, ring buffer, detector and analyzer unit tests
 make sanitize           # the same tests under AddressSanitizer + UBSan
-make tsan               # ring buffer tests under ThreadSanitizer
+make tsan               # the threaded tests (ring buffer, analyzer) under ThreadSanitizer
 ```
 
 With CMake, run `ctest --test-dir build`.
@@ -145,6 +215,24 @@ slots) it pushes 1,000,000 frames and checks every one arrives in order with
 intact contents and metadata. In lossy mode the producer drops when the ring
 is full, and the test checks that `delivered + dropped == offered`. Set
 `RB_STRESS_ITERS` to change the frame count; `make tsan` uses 200,000.
+
+The detector tests cover the strict `> 30` and `> 20` boundaries, SYN floods
+against one port, SYN-ACK / ACK / RST / UDP / IPv6 being ignored, exact
+window expiry, slow scans, bursts that straddle a second boundary, a custom
+window, the clock going backwards, and alert cadence (one per episode,
+re-alert, re-arm). They also check LRU eviction order and that an evicted
+source starts fresh. A churn test mixes 100,000 one-off sources with a
+scanner, which is still detected, and another test runs 1024 simultaneous
+scanners. Finally, 100,000 random SYNs cross-check the incremental
+distinct-port count against a brute-force recount.
+
+The analyzer tests cover protocol and status classification, rate
+computation over the sliding 1 s sample window (including idle decay), and
+alert ring overflow and incremental polling. A concurrent test runs one
+writer, two snapshot readers, a ticker, an alert pusher, and an alert poller.
+It checks that every snapshot is internally consistent and that alerts
+arrive in order with none repeated. Set `ANA_STRESS_ITERS` to change the
+packet count.
 
 On some Clang installs the sanitizer runtimes are missing. If `make sanitize`
 or `make tsan` fails to link, use `make CC=gcc sanitize` or `make CC=gcc tsan`.
@@ -207,10 +295,11 @@ syscall and copy.
 ```
 net-analyzer/
 ├── Makefile, CMakeLists.txt
-├── include/   parser.h, ring_buffer.h, config.h (+ placeholder headers for later phases)
-├── src/       main.c (threads, signals), parser.c (dissector), ring_buffer.c (SPSC ring)
+├── include/   parser.h, ring_buffer.h, detector.h, analyzer.h, config.h (+ placeholders for Phase 4)
+├── src/       main.c (threads, signals), parser.c (dissector), ring_buffer.c (SPSC ring),
+│              detector.c (port-scan detector), analyzer.c (shared metrics + alerts)
 ├── scripts/   bench_loopback.sh (iperf3 drop-rate benchmark)
-└── tests/     test_parser.c, test_ring_buffer.c
+└── tests/     test_parser.c, test_ring_buffer.c, test_detector.c, test_analyzer.c
 ```
 
 ## License

@@ -1,4 +1,6 @@
+#include "analyzer.h"
 #include "config.h"
+#include "detector.h"
 #include "parser.h"
 #include "ring_buffer.h"
 
@@ -32,13 +34,7 @@ struct options {
     size_t ring_slots;
     int promisc;
     int quiet;
-};
-
-struct counters {
-    unsigned long long seen;
-    unsigned long long ok;
-    unsigned long long truncated;
-    unsigned long long malformed;
+    int stats;
 };
 
 struct capture {
@@ -47,7 +43,8 @@ struct capture {
     struct ring_buffer ring;
     atomic_int ingest_done;
     int ingest_rc;
-    struct counters ctr;              /* written by the worker only */
+    struct analyzer ana;              /* shared metrics; see analyzer.h */
+    struct detector det;              /* owned by the worker */
 };
 
 /*
@@ -87,12 +84,13 @@ static int has_cap_net_raw(void)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-p] [-q] [-h]\n"
+            "Usage: %s [-i IFACE] [-c COUNT] [-b SLOTS] [-p] [-q] [-s] [-h]\n"
             "  -i IFACE  capture only on IFACE (default: all interfaces)\n"
             "  -c COUNT  stop after COUNT packets\n"
             "  -b SLOTS  ring buffer slots, 64 KiB each (default: %d)\n"
             "  -p        put IFACE into promiscuous mode (requires -i)\n"
-            "  -q        quiet: dissect but do not print packets\n"
+            "  -q        quiet: dissect but do not print packets (alerts still print)\n"
+            "  -s        print a traffic stats line to stderr every second\n"
             "  -h        show this help\n",
             prog, DEFAULT_RING_SLOTS);
 }
@@ -104,7 +102,7 @@ static int parse_args(int argc, char **argv, struct options *opt)
 
     memset(opt, 0, sizeof(*opt));
     opt->ring_slots = DEFAULT_RING_SLOTS;
-    while ((c = getopt(argc, argv, "i:c:b:pqh")) != -1) {
+    while ((c = getopt(argc, argv, "i:c:b:pqsh")) != -1) {
         switch (c) {
         case 'i':
             opt->iface = optarg;
@@ -135,6 +133,9 @@ static int parse_args(int argc, char **argv, struct options *opt)
             break;
         case 'q':
             opt->quiet = 1;
+            break;
+        case 's':
+            opt->stats = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -223,15 +224,25 @@ static void print_packet(const struct rb_slot *s, const struct pkt_info *info)
            s->pkttype == PACKET_OUTGOING ? "OUT" : "IN", line);
 }
 
-static void count(struct counters *c, enum pkt_status st)
+static uint64_t ts_ns(const struct timespec *ts)
 {
-    c->seen++;
-    switch (st) {
-    case PKT_OK:          c->ok++; break;
-    case PKT_TRUNCATED:   c->truncated++; break;
-    case PKT_MALFORMED:   c->malformed++; break;
-    case PKT_INVALID_ARG: break;
-    }
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
+static void print_alert(const struct rb_slot *s, const struct det_alert *a,
+                        const struct det_config *cfg)
+{
+    struct tm tm;
+    char src[INET_ADDRSTRLEN];
+
+    localtime_r(&s->ts.tv_sec, &tm);
+    inet_ntop(AF_INET, &a->src_ip, src, sizeof(src));
+    printf("%02d:%02d:%02d.%06ld !!! ALERT %s src=%s syns=%u ports=%u "
+           "window=%.1fs last_dport=%u\n",
+           tm.tm_hour, tm.tm_min, tm.tm_sec, s->ts.tv_nsec / 1000L,
+           det_event_str(a->type), src, a->syn_count, a->distinct_ports,
+           (double)cfg->window_ns / 1e9, a->last_dst_port);
+    fflush(stdout);
 }
 
 static void fill_slot(struct rb_slot *s, size_t wire_len,
@@ -306,6 +317,7 @@ static void *worker_thread(void *arg)
     struct ring_buffer *rb = &cap->ring;
     const struct options *opt = cap->opt;
     struct pkt_info info;
+    struct det_alert alert;
     unsigned spins = 0;
 
     for (;;) {
@@ -323,12 +335,21 @@ static void *worker_thread(void *arg)
         }
         spins = 0;
 
-        count(&cap->ctr, parse_packet(s->data, s->cap_len, &info));
+        parse_packet(s->data, s->cap_len, &info);
+        ana_record(&cap->ana, &info, s->orig_len);
         if (!opt->quiet)
             print_packet(s, &info);
+        /* Outgoing frames are skipped so loopback traffic, which is seen
+         * once as OUT and once as IN, is only counted once. */
+        if (s->pkttype != PACKET_OUTGOING &&
+            det_observe(&cap->det, &info, ts_ns(&s->ts), &alert)) {
+            ana_push_alert(&cap->ana, &alert);
+            print_alert(s, &alert, &cap->det.cfg);
+        }
         rb_release(rb);
 
-        if (opt->max_packets != 0 && cap->ctr.seen >= opt->max_packets) {
+        if (opt->max_packets != 0 &&
+            ana_packets(&cap->ana) >= opt->max_packets) {
             request_stop();
             break;
         }
@@ -337,19 +358,51 @@ static void *worker_thread(void *arg)
     return NULL;
 }
 
+static void print_stats_line(struct analyzer *ana)
+{
+    struct ana_snapshot sn;
+    double total;
+
+    ana_snapshot(ana, &sn);
+    total = sn.packets ? (double)sn.packets : 1.0;
+    fprintf(stderr,
+            "[stats] %.0f pkt/s %.1f KB/s | total %llu pkts %llu bytes | "
+            "TCP %.1f%% UDP %.1f%% ICMP %.1f%% Other %.1f%% | alerts %llu\n",
+            sn.pps, sn.bytes_per_sec / 1024.0,
+            (unsigned long long)sn.packets, (unsigned long long)sn.bytes,
+            100.0 * (double)sn.proto[ANA_PROTO_TCP] / total,
+            100.0 * (double)sn.proto[ANA_PROTO_UDP] / total,
+            100.0 * (double)sn.proto[ANA_PROTO_ICMP] / total,
+            100.0 * (double)sn.proto[ANA_PROTO_OTHER] / total,
+            (unsigned long long)sn.alerts);
+}
+
 /*
  * Runs on the main thread with SIGINT/SIGTERM blocked process-wide, so it is
- * the only place those signals are ever handled.
+ * the only place those signals are ever handled. It is also the analyzer's
+ * rate ticker.
  */
-static void wait_for_stop(const sigset_t *set)
+static void wait_for_stop(struct capture *cap, const sigset_t *set)
 {
     static const struct timespec tick = { 0, 100000000 };  /* 100 ms */
+    uint64_t next_print = 0;
 
     while (!stop_requested()) {
+        struct timespec now;
+        uint64_t now_ns;
         int sig = sigtimedwait(set, NULL, &tick);
 
         if (sig == SIGINT || sig == SIGTERM)
             request_stop();
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        now_ns = ts_ns(&now);
+        ana_tick(&cap->ana, now_ns);
+        if (cap->opt->stats && now_ns >= next_print) {
+            if (next_print != 0)
+                print_stats_line(&cap->ana);
+            next_print = now_ns + 1000000000ULL;
+        }
     }
 }
 
@@ -360,12 +413,30 @@ static void print_summary(struct capture *cap)
     socklen_t ks_len = sizeof(ks);
     unsigned long long offered;
 
+    struct ana_snapshot sn;
+    struct det_stats ds;
+
     rb_get_stats(&cap->ring, &rs);
     offered = (unsigned long long)(rs.pushed + rs.dropped);
+    ana_snapshot(&cap->ana, &sn);
+    det_get_stats(&cap->det, &ds);
 
     fprintf(stderr,
             "\n%llu packets dissected: %llu ok, %llu truncated, %llu malformed\n",
-            cap->ctr.seen, cap->ctr.ok, cap->ctr.truncated, cap->ctr.malformed);
+            (unsigned long long)sn.packets, (unsigned long long)sn.ok,
+            (unsigned long long)sn.truncated, (unsigned long long)sn.malformed);
+    fprintf(stderr,
+            "traffic: %llu bytes | TCP %llu, UDP %llu, ICMP %llu, Other %llu\n",
+            (unsigned long long)sn.bytes,
+            (unsigned long long)sn.proto[ANA_PROTO_TCP],
+            (unsigned long long)sn.proto[ANA_PROTO_UDP],
+            (unsigned long long)sn.proto[ANA_PROTO_ICMP],
+            (unsigned long long)sn.proto[ANA_PROTO_OTHER]);
+    fprintf(stderr,
+            "detector: %llu SYNs from %u tracked sources, %llu evicted, "
+            "%llu alerts\n",
+            (unsigned long long)ds.syns_seen, ds.tracked,
+            (unsigned long long)ds.evictions, (unsigned long long)sn.alerts);
     fprintf(stderr,
             "ring (%zu slots): %llu queued, %llu dropped (%.3f%%), %zu left unprocessed\n",
             cap->ring.capacity, (unsigned long long)rs.pushed,
@@ -422,6 +493,14 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     atomic_init(&cap.ingest_done, 0);
+    err = ana_init(&cap.ana);
+    if (err != 0) {
+        fprintf(stderr, "analyzer: %s\n", strerror(err));
+        rb_destroy(&cap.ring);
+        close(cap.fd);
+        return EXIT_FAILURE;
+    }
+    det_init(&cap.det, NULL);
 
     fprintf(stderr, "capturing on %s%s, %zu ring slots (Ctrl-C to stop)\n",
             opt.iface ? opt.iface : "all interfaces",
@@ -437,12 +516,13 @@ int main(int argc, char **argv)
     }
     if (err != 0) {
         fprintf(stderr, "pthread_create: %s\n", strerror(err));
+        ana_destroy(&cap.ana);
         rb_destroy(&cap.ring);
         close(cap.fd);
         return EXIT_FAILURE;
     }
 
-    wait_for_stop(&sigs);
+    wait_for_stop(&cap, &sigs);
 
     /* Ingestion exits within one SO_RCVTIMEO tick; the worker then drains. */
     pthread_join(ingest, NULL);
@@ -450,6 +530,7 @@ int main(int argc, char **argv)
 
     fflush(stdout);
     print_summary(&cap);
+    ana_destroy(&cap.ana);
     rb_destroy(&cap.ring);
     close(cap.fd);
     return cap.ingest_rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
