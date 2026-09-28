@@ -29,6 +29,7 @@ struct ui_config {
     struct ring_buffer *ring;        /* optional; shows live ring drops */
     const char *iface;               /* NULL = all interfaces */
     const char *pcap_path;           /* NULL = not writing */
+    const char *ingest;              /* short path name, or NULL */
     atomic_int *stop;
     atomic_int *resize;
 };

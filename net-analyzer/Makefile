@@ -11,11 +11,11 @@ CURSES_LIBS ?= $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncursesw
 BUILD    := build
 BIN      := $(BUILD)/net-analyzer
 TESTS    := test_parser test_ring_buffer test_detector test_analyzer \
-            test_pcap_writer test_feed
+            test_pcap_writer test_feed test_rx_ring
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 LIB_SRCS := src/parser.c src/ring_buffer.c src/detector.c src/analyzer.c \
-            src/pcap_writer.c src/feed.c
+            src/pcap_writer.c src/feed.c src/rx_ring.c
 APP_SRCS := src/main.c src/ui.c $(LIB_SRCS)
 
 LIB_OBJS := $(LIB_SRCS:%.c=$(BUILD)/%.o)
@@ -54,10 +54,11 @@ tsan:
 	$(MAKE) BUILD=$(BUILD)/tsan CFLAGS="$(TSAN_FLAGS)" \
 	        LDFLAGS="-pthread -fsanitize=thread" \
 	        $(BUILD)/tsan/test_ring_buffer $(BUILD)/tsan/test_analyzer \
-	        $(BUILD)/tsan/test_feed
+	        $(BUILD)/tsan/test_feed $(BUILD)/tsan/test_rx_ring
 	RB_STRESS_ITERS=200000 ./$(BUILD)/tsan/test_ring_buffer
 	ANA_STRESS_ITERS=200000 ./$(BUILD)/tsan/test_analyzer
 	FEED_STRESS_ITERS=200000 ./$(BUILD)/tsan/test_feed
+	./$(BUILD)/tsan/test_rx_ring
 
 clean:
 	rm -rf $(BUILD)
